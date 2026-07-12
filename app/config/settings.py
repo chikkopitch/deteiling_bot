@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     MANAGER_USERNAME: str
     MANAGER_IDS: tuple[int, ...] = ()
     DATABASE_URL: str
-    REDIS_URL: str
+    REDIS_URL: str | None = None
     STUDIO_TIMEZONE: str = "Asia/Yekaterinburg"
     STUDIO_NAME: str
     STUDIO_ADDRESS: str

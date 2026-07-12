@@ -12,13 +12,15 @@ from app.database import Database
 async def check() -> None:
     settings = get_settings()
     database = Database(settings.DATABASE_URL)
-    redis = Redis.from_url(settings.REDIS_URL)
+    redis = Redis.from_url(settings.REDIS_URL) if settings.REDIS_URL else None
     try:
         async with database.session_factory() as session:
             await session.execute(text("SELECT 1"))
-        await redis.ping()
+        if redis:
+            await redis.ping()
     finally:
-        await redis.aclose()
+        if redis:
+            await redis.aclose()
         await database.close()
 
 

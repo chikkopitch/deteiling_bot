@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from redis.asyncio import Redis
@@ -25,18 +26,21 @@ log = structlog.get_logger()
 
 
 @asynccontextmanager
-async def lifespan(settings: Settings) -> AsyncIterator[tuple[Bot, Dispatcher, Database, Redis]]:
+async def lifespan(
+    settings: Settings,
+) -> AsyncIterator[tuple[Bot, Dispatcher, Database, Redis | None]]:
     configure_logging(settings.LOG_LEVEL)
     database = Database(settings.DATABASE_URL)
-    redis = Redis.from_url(settings.REDIS_URL)
+    redis = Redis.from_url(settings.REDIS_URL) if settings.REDIS_URL else None
     bot = Bot(settings.BOT_TOKEN)
-    dispatcher = Dispatcher(storage=RedisStorage(redis))
+    dispatcher = Dispatcher(storage=RedisStorage(redis) if redis else MemoryStorage())
     scheduler = AsyncIOScheduler(timezone="UTC")
     worker = NotificationWorker(database, bot, settings)
     dispatcher.update.outer_middleware(DatabaseMiddleware(database))
     dispatcher.update.outer_middleware(LoggingMiddleware())
     dispatcher.update.outer_middleware(ContextMiddleware())
-    dispatcher.update.outer_middleware(ThrottleMiddleware(redis))
+    if redis:
+        dispatcher.update.outer_middleware(ThrottleMiddleware(redis))
     dispatcher["settings"] = settings
     dispatcher.include_router(root_router(settings))
     scheduler.add_job(
@@ -46,13 +50,15 @@ async def lifespan(settings: Settings) -> AsyncIterator[tuple[Bot, Dispatcher, D
     try:
         async with database.session_factory() as session:
             await session.execute(text("SELECT 1"))
-        await redis.ping()
+        if redis:
+            await redis.ping()
         yield bot, dispatcher, database, redis
     finally:
         scheduler.shutdown(wait=False)
         await dispatcher.storage.close()
         await bot.session.close()
-        await redis.aclose()
+        if redis:
+            await redis.aclose()
         await database.close()
 
 
