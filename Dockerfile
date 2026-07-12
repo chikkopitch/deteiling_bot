@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir ".[dev]"
 COPY . .
 RUN chown -R bot:bot /app
 USER bot
-CMD ["python", "-m", "app.main"]
+CMD ["sh", "-c", "alembic upgrade head && python -m app.seed && exec python -m app.main"]
