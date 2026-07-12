@@ -8,6 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import text
 
 from app.bot.handlers import root_router
@@ -31,7 +32,16 @@ async def lifespan(
 ) -> AsyncIterator[tuple[Bot, Dispatcher, Database, Redis | None]]:
     configure_logging(settings.LOG_LEVEL)
     database = Database(settings.DATABASE_URL)
-    redis = Redis.from_url(settings.REDIS_URL) if settings.REDIS_URL else None
+    redis: Redis | None = None
+    if settings.REDIS_URL:
+        redis_candidate = Redis.from_url(settings.REDIS_URL)
+        try:
+            await redis_candidate.ping()
+        except RedisError as error:
+            await log.awarning("redis_unavailable_using_memory_storage", error_type=type(error).__name__)
+            await redis_candidate.aclose()
+        else:
+            redis = redis_candidate
     bot = Bot(settings.BOT_TOKEN)
     dispatcher = Dispatcher(storage=RedisStorage(redis) if redis else MemoryStorage())
     scheduler = AsyncIOScheduler(timezone="UTC")
@@ -50,8 +60,6 @@ async def lifespan(
     try:
         async with database.session_factory() as session:
             await session.execute(text("SELECT 1"))
-        if redis:
-            await redis.ping()
         yield bot, dispatcher, database, redis
     finally:
         scheduler.shutdown(wait=False)

@@ -3,6 +3,7 @@
 import asyncio
 
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import text
 
 from app.config import get_settings
@@ -17,7 +18,10 @@ async def check() -> None:
         async with database.session_factory() as session:
             await session.execute(text("SELECT 1"))
         if redis:
-            await redis.ping()
+            try:
+                await redis.ping()
+            except RedisError:
+                pass
     finally:
         if redis:
             await redis.aclose()
