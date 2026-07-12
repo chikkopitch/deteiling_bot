@@ -1,4 +1,5 @@
-from app.database.base import Base
-from app.database.session import Database, get_database
+"""Database infrastructure."""
 
-__all__ = ["Base", "Database", "get_database"]
+from app.database.session import Database, create_database
+
+__all__ = ["Database", "create_database"]

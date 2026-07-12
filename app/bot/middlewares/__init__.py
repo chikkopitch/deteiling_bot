@@ -1,4 +1,13 @@
-from app.bot.middlewares.context import ContextMiddleware, LoggingMiddleware, ThrottleMiddleware
-from app.bot.middlewares.database import DatabaseMiddleware
+"""Custom Aiogram middlewares."""
 
-__all__ = ["ContextMiddleware", "DatabaseMiddleware", "LoggingMiddleware", "ThrottleMiddleware"]
+from app.bot.middlewares.blocked import BlockedUserMiddleware
+from app.bot.middlewares.database import DatabaseSessionMiddleware
+from app.bot.middlewares.logging import UpdateLoggingMiddleware
+from app.bot.middlewares.user import UserRegistrationMiddleware
+
+__all__ = [
+    "BlockedUserMiddleware",
+    "DatabaseSessionMiddleware",
+    "UpdateLoggingMiddleware",
+    "UserRegistrationMiddleware",
+]

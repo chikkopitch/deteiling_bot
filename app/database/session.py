@@ -1,5 +1,11 @@
-from collections.abc import AsyncIterator
+"""Async SQLAlchemy engine, session factory, and health check."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol
+
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -8,18 +14,41 @@ from sqlalchemy.ext.asyncio import (
 )
 
 
+class DatabaseConfiguration(Protocol):
+    database_url: str
+
+
+@dataclass(slots=True)
 class Database:
-    def __init__(self, url: str) -> None:
-        self.engine: AsyncEngine = create_async_engine(url, pool_pre_ping=True)
-        self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
+    """Own the SQLAlchemy engine and its AsyncSession factory."""
 
-    async def session(self) -> AsyncIterator[AsyncSession]:
-        async with self.session_factory() as session:
-            yield session
+    engine: AsyncEngine
+    session_factory: async_sessionmaker[AsyncSession]
 
-    async def close(self) -> None:
+    async def check_connection(self) -> None:
+        """Execute a minimal PostgreSQL query or propagate the driver error."""
+        async with self.engine.connect() as connection:
+            result = await connection.execute(text("SELECT 1"))
+            if result.scalar_one() != 1:
+                raise RuntimeError("PostgreSQL health check returned an invalid result")
+
+    async def dispose(self) -> None:
+        """Close every pooled PostgreSQL connection owned by this process."""
         await self.engine.dispose()
 
 
-def get_database(url: str) -> Database:
-    return Database(url)
+def create_database(settings: DatabaseConfiguration) -> Database:
+    """Create the async engine and reusable AsyncSession factory."""
+    engine = create_async_engine(
+        settings.database_url,
+        pool_pre_ping=True,
+        echo=False,
+        connect_args={"server_settings": {"timezone": "UTC"}},
+    )
+    session_factory = async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    return Database(engine=engine, session_factory=session_factory)

@@ -1,29 +1,29 @@
+"""One AsyncSession and one transaction per Telegram update."""
+
+from __future__ import annotations
+
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject
-
-from app.database import Database
-from app.repositories import UserRepository
+from aiogram.types import Update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
-class DatabaseMiddleware(BaseMiddleware):
-    def __init__(self, database: Database) -> None:
-        self.database = database
-
+class DatabaseSessionMiddleware(BaseMiddleware):
     async def __call__(
         self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
+        handler: Callable[[Update, dict[str, Any]], Awaitable[Any]],
+        event: Update,
         data: dict[str, Any],
     ) -> Any:
-        async with self.database.session_factory() as session:
+        session_factory: async_sessionmaker[AsyncSession] = data["session_factory"]
+        async with session_factory() as session:
             data["session"] = session
-            user = getattr(event, "from_user", None)
-            if user:
-                data["db_user"] = await UserRepository(session).upsert_telegram(
-                    user.id, user.username, user.first_name, user.last_name
-                )
+            try:
+                result = await handler(event, data)
                 await session.commit()
-            return await handler(event, data)
+                return result
+            except BaseException:
+                await session.rollback()
+                raise

@@ -1,1 +1,1 @@
-"""Telegram interface."""
+"""Telegram presentation layer."""

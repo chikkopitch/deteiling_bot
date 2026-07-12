@@ -1,1 +1,1 @@
-"""Shared utilities."""
+"""Small reusable application utilities."""

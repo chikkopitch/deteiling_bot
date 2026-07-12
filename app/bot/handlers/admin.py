@@ -1,904 +1,856 @@
-from datetime import timedelta
+"""Database-authorized Telegram admin panel entry and callbacks."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+import json
 from uuid import UUID
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import BaseFilter
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select
 
-from app.bot.filters import IsAdmin
-from app.bot.keyboards.callbacks import AdminCallback, BookingCallback, MenuCallback
-from app.bot.states import AdminStates
-from app.config import Settings
-from app.models import (
-    AuditLog,
-    Booking,
-    BookingPhoto,
-    BookingStatus,
+from app.bot.keyboards.admin import (
+    AdminApplicationCallback,
+    AdminChangeCallback,
+    AdminPanelCallback,
+    admin_menu_keyboard,
+)
+from app.bot.keyboards.appointment_actions import (
+    RejectAppointmentCallback,
+    TYPICAL_REJECTION_REASONS,
+    rejection_confirmation_keyboard,
+    rejection_reasons_keyboard,
+)
+from app.core.config import Settings
+from app.database.enums import AppointmentStatus
+from app.database.models import (
+    Appointment,
+    CalculationFactor,
+    CalculationFactorValue,
+    ConversationState,
     FAQItem,
     ManagerRequest,
-    ManagerRequestStatus,
     Service,
-    SlotStatus,
-    TimeSlot,
+    ServicePrice,
     User,
 )
-from app.services import BookingService
-from app.services.errors import InvalidTransitionError, SlotUnavailableError
-from app.utils.datetime import format_studio_time, utc_now
+from app.database.repositories import (
+    ConversationStateRepository,
+    AvailableSlotRepository,
+)
+from app.services.admin_auth import (
+    AdminAccessDenied,
+    AdminAuthorizationService,
+    Permission,
+)
+from app.services.admin_notifications import build_admin_application_text
+from app.services.application_summary import ApplicationSummaryService
+from app.services.admin_appointments import AdminAppointmentService
+from app.services.appointment_changes import AppointmentChangeService
+from app.services.client_notifications import ClientNotificationService
+from app.services.content_admin import (
+    ContentAdminService,
+    EDITABLE_CONTENT,
+    effective_reminder_hours,
+)
+from app.bot.keyboards.content_admin import (
+    ContentAdminCallback,
+    content_preview_keyboard,
+    content_settings_keyboard,
+)
+from app.bot.keyboards.entity_admin import (
+    EntityAdminCallback,
+    entity_list_keyboard,
+    entity_preview_keyboard,
+)
+from app.bot.keyboards.manager import manager_request_keyboard
+from app.services.entity_admin import EntityAdminService
+from app.services.vehicle_selection import VehicleSelectionError, clean_user_text
 
 router = Router(name="admin")
-PAGE_SIZE = 8
+ADMIN_REJECT_FLOW = "admin_reject"
+ADMIN_CHANGE_FLOW = "admin_change"
 
+SECTION_PERMISSIONS = {
+    "admins": Permission.MANAGE_ADMINS,
+    "roles": Permission.MANAGE_ADMINS,
+    "new": Permission.VIEW_APPOINTMENTS,
+    "today": Permission.VIEW_APPOINTMENTS,
+    "tomorrow": Permission.VIEW_APPOINTMENTS,
+    "future": Permission.VIEW_APPOINTMENTS,
+    "all": Permission.VIEW_APPOINTMENTS,
+    "schedule": Permission.MANAGE_SCHEDULE,
+    "free_slots": Permission.MANAGE_SCHEDULE,
+    "services": Permission.MANAGE_SERVICES,
+    "prices": Permission.MANAGE_PRICES,
+    "calculator": Permission.MANAGE_PRICES,
+    "faq": Permission.MANAGE_FAQ,
+    "requests": Permission.MANAGE_REQUESTS,
+    "clients": Permission.VIEW_CLIENTS,
+    "statistics": Permission.VIEW_STATISTICS,
+    "settings": Permission.MANAGE_SETTINGS,
+    "audit": Permission.VIEW_AUDIT,
+}
 
-def setup(settings: Settings) -> None:
-    router.message.filter(IsAdmin(settings.ADMIN_IDS))
-    router.callback_query.filter(IsAdmin(settings.ADMIN_IDS))
-
-
-def admin_menu() -> InlineKeyboardMarkup:
-    entries = [
-        ("Новые заявки", "pending"),
-        ("Подтверждённые", "confirmed"),
-        ("Сегодня", "today"),
-        ("На этой неделе", "week"),
-        ("Отменённые", "cancelled"),
-        ("Расписание", "schedule"),
-        ("Услуги", "services"),
-        ("FAQ", "faq"),
-        ("Настройки", "settings"),
-    ]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=text, callback_data=AdminCallback(action="list", value=f"{scope}:0").pack()
-                )
-            ]
-            for text, scope in entries
-        ]
-    )
-
-
-def admin_card_keyboard(booking_id: UUID, owner: User) -> InlineKeyboardMarkup:
-    entity_id = str(booking_id)
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Подтвердить",
-                    callback_data=AdminCallback(action="confirm", entity_id=entity_id).pack(),
-                ),
-                InlineKeyboardButton(
-                    text="Отклонить",
-                    callback_data=AdminCallback(action="reject", entity_id=entity_id).pack(),
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Предложить другое время",
-                    callback_data=AdminCallback(action="propose", entity_id=entity_id).pack(),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Написать клиенту", url=f"tg://user?id={owner.telegram_id}"
-                ),
-                InlineKeyboardButton(text="Позвонить", url=f"tel:{owner.phone or ''}"),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Открыть профиль", url=f"tg://user?id={owner.telegram_id}"
-                ),
-                InlineKeyboardButton(
-                    text="История",
-                    callback_data=AdminCallback(action="history", entity_id=entity_id).pack(),
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-                )
-            ],
-        ]
-    )
-
-
-async def get_booking(session: AsyncSession, booking_id: UUID) -> Booking | None:
-    return await session.scalar(
-        select(Booking)
-        .where(Booking.id == booking_id)
-        .options(
-            selectinload(Booking.services),
-            selectinload(Booking.vehicle),
-            selectinload(Booking.slot),
-        )
-    )
-
-
-async def card_text(
-    session: AsyncSession, booking: Booking, settings: Settings
-) -> tuple[str, User | None]:
-    owner = await session.get(User, booking.user_id)
-    profile = f"@{owner.username}" if owner and owner.username else "профиль без username"
-    services = ", ".join(item.name for item in booking.services) or "не выбраны"
-    slot = (
-        format_studio_time(booking.slot.starts_at, settings.STUDIO_TIMEZONE)
-        if booking.slot
-        else "не выбран"
-    )
-    estimate = "не рассчитывалась"
-    if booking.estimated_min is not None and booking.estimated_max is not None:
-        estimate = f"{booking.estimated_min:.0f}–{booking.estimated_max:.0f} ₽"
-    return (
-        f"Заявка #{str(booking.id)[:8]}\n"
-        f"Статус: {booking.status.value}\n"
-        f"Клиент: {booking.customer_name} ({profile})\n"
-        f"Телефон: {booking.customer_phone}\n"
-        f"Автомобиль: {booking.vehicle.brand_name} {booking.vehicle.model_name}, {booking.vehicle.year}\n"
-        f"Класс: {booking.vehicle.vehicle_class}\n"
-        f"Услуги: {services}\n"
-        f"Предварительно: {estimate}\n"
-        f"Дата и время: {slot}\n"
-        f"Адрес: {settings.STUDIO_ADDRESS}\n"
-        f"Комментарий: {booking.comment or '—'}\n"
-        f"Создано: {format_studio_time(booking.created_at, settings.STUDIO_TIMEZONE)}",
-        owner,
-    )
+APPLICATION_ACTION_PERMISSIONS = {
+    "confirm": Permission.MANAGE_APPOINTMENTS,
+    "reject": Permission.MANAGE_APPOINTMENTS,
+    "reschedule": Permission.MANAGE_APPOINTMENTS,
+    "write": Permission.VIEW_APPOINTMENTS,
+    "open": Permission.VIEW_APPOINTMENTS,
+}
 
 
 @router.message(Command("admin"))
-async def admin(message: Message) -> None:
-    await message.answer("Админ-панель", reply_markup=admin_menu())
-
-
-@router.callback_query(AdminCallback.filter(F.action == "menu"))
-async def menu(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    if callback.message:
-        await callback.message.edit_text("Админ-панель", reply_markup=admin_menu())
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "manager_reply"))
-async def manager_reply_start(
-    callback: CallbackQuery, callback_data: AdminCallback, state: FSMContext
-) -> None:
-    await state.update_data(manager_request_id=callback_data.entity_id)
-    await state.set_state(AdminStates.reply)
-    if callback.message:
-        await callback.message.edit_text("Напишите ответ клиенту:")
-    await callback.answer()
-
-
-@router.message(AdminStates.reply)
-async def manager_reply_preview(message: Message, state: FSMContext) -> None:
-    response = " ".join((message.text or "").split())
-    if not 1 <= len(response) <= 2000:
-        await message.answer("Ответ должен быть от 1 до 2000 символов.")
+async def handle_admin(message: Message, session: AsyncSession) -> None:
+    if message.from_user is None:
         return
-    await state.update_data(manager_response=response)
-    await message.answer(
-        "Предпросмотр ответа:\n\n" + response,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Отправить",
-                        callback_data=AdminCallback(action="manager_reply_send").pack(),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="Изменить",
-                        callback_data=AdminCallback(action="manager_reply_edit").pack(),
-                    )
-                ],
-            ]
-        ),
-    )
-
-
-@router.callback_query(AdminStates.reply, AdminCallback.filter(F.action == "manager_reply_edit"))
-async def manager_reply_edit(callback: CallbackQuery) -> None:
-    if callback.message:
-        await callback.message.edit_text("Напишите новую версию ответа:")
-    await callback.answer()
-
-
-@router.callback_query(AdminStates.reply, AdminCallback.filter(F.action == "manager_reply_send"))
-async def manager_reply_send(
-    callback: CallbackQuery, state: FSMContext, session: AsyncSession, db_user: User
-) -> None:
-    data = await state.get_data()
-    request = await session.get(ManagerRequest, UUID(data["manager_request_id"]))
-    if request is None or request.status == ManagerRequestStatus.CLOSED:
-        await callback.answer("Обращение закрыто или не найдено.", show_alert=True)
-        return
-    request.response, request.status = data["manager_response"], ManagerRequestStatus.ANSWERED
-    session.add(
-        AuditLog(
-            actor_user_id=db_user.id,
-            action="manager_request.answered",
-            entity_type="manager_request",
-            entity_id=request.id,
-            details={},
-        )
-    )
-    await session.commit()
-    client = await session.get(User, request.user_id)
-    if client:
-        await callback.bot.send_message(client.telegram_id, data["manager_response"])
-    await state.clear()
-    if callback.message:
-        await callback.message.edit_text("Ответ отправлен.", reply_markup=admin_menu())
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "manager_close"))
-async def manager_close(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession, db_user: User
-) -> None:
-    request = await session.get(ManagerRequest, UUID(callback_data.entity_id))
-    if request is None:
-        await callback.answer("Обращение не найдено.", show_alert=True)
-        return
-    if request.status != ManagerRequestStatus.CLOSED:
-        request.status = ManagerRequestStatus.CLOSED
-        session.add(
-            AuditLog(
-                actor_user_id=db_user.id,
-                action="manager_request.closed",
-                entity_type="manager_request",
-                entity_id=request.id,
-                details={},
-            )
-        )
-        await session.commit()
-    if callback.message:
-        await callback.message.edit_text("Обращение закрыто.", reply_markup=admin_menu())
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "service_manage"))
-async def service_manage(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
-) -> None:
-    item = await session.get(Service, UUID(callback_data.entity_id))
-    if item is None:
-        await callback.answer("Услуга не найдена.", show_alert=True)
-        return
-    text = f"{item.name}\nЦена от: {item.price_from} ₽\nДлительность: {item.duration_minutes} мин.\nАктивна: {'да' if item.is_active else 'нет'}"
-    rows = [
-        [
-            InlineKeyboardButton(
-                text="Включить/выключить",
-                callback_data=AdminCallback(action="service_toggle", entity_id=str(item.id)).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="Удалить",
-                callback_data=AdminCallback(action="service_delete", entity_id=str(item.id)).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-            )
-        ],
-    ]
-    if callback.message:
-        await callback.message.edit_text(
-            text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-        )
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action.in_({"service_toggle", "service_delete"})))
-async def service_mutate(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession, db_user: User
-) -> None:
-    item = await session.get(Service, UUID(callback_data.entity_id))
-    if item is None:
-        await callback.answer("Услуга не найдена.", show_alert=True)
-        return
-    if callback_data.action == "service_toggle":
-        item.is_active = not item.is_active
-        action = "service.toggled"
-    else:
-        item.is_active, item.deleted_at, action = False, utc_now(), "service.soft_deleted"
-    session.add(
-        AuditLog(
-            actor_user_id=db_user.id,
-            action=action,
-            entity_type="service",
-            entity_id=item.id,
-            details={},
-        )
-    )
-    await session.commit()
-    if callback.message:
-        await callback.message.edit_text("Изменение сохранено.", reply_markup=admin_menu())
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "faq_manage"))
-async def faq_manage(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
-) -> None:
-    item = await session.get(FAQItem, UUID(callback_data.entity_id))
-    if item is None:
-        await callback.answer("FAQ не найден.", show_alert=True)
-        return
-    rows = [
-        [
-            InlineKeyboardButton(
-                text="Включить/выключить",
-                callback_data=AdminCallback(action="faq_toggle", entity_id=str(item.id)).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="Удалить",
-                callback_data=AdminCallback(action="faq_delete", entity_id=str(item.id)).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-            )
-        ],
-    ]
-    if callback.message:
-        await callback.message.edit_text(
-            f"{item.question}\n\n{item.answer}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        )
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action.in_({"faq_toggle", "faq_delete"})))
-async def faq_mutate(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession, db_user: User
-) -> None:
-    item = await session.get(FAQItem, UUID(callback_data.entity_id))
-    if item is None:
-        await callback.answer("FAQ не найден.", show_alert=True)
-        return
-    if callback_data.action == "faq_toggle":
-        item.is_active = not item.is_active
-        action = "faq.toggled"
-    else:
-        item.is_active, item.deleted_at, action = False, utc_now(), "faq.soft_deleted"
-    session.add(
-        AuditLog(
-            actor_user_id=db_user.id,
-            action=action,
-            entity_type="faq",
-            entity_id=item.id,
-            details={},
-        )
-    )
-    await session.commit()
-    if callback.message:
-        await callback.message.edit_text("Изменение сохранено.", reply_markup=admin_menu())
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "slot_manage"))
-async def slot_manage(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
-) -> None:
-    slot = await session.get(TimeSlot, UUID(callback_data.entity_id))
-    if slot is None:
-        await callback.answer("Слот не найден.", show_alert=True)
-        return
-    if slot.status == SlotStatus.BOOKED:
-        await callback.answer(
-            "Подтверждённый слот нельзя блокировать автоматически.", show_alert=True
-        )
-        return
-    slot.status = SlotStatus.BLOCKED if slot.status != SlotStatus.BLOCKED else SlotStatus.AVAILABLE
-    await session.commit()
-    if callback.message:
-        await callback.message.edit_text(
-            f"Статус слота: {slot.status.value}", reply_markup=admin_menu()
-        )
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "list"))
-async def list_bookings(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
-) -> None:
     try:
-        scope, raw_page = callback_data.value.split(":", 1)
-        page = max(0, int(raw_page))
-    except ValueError:
-        await callback.answer("Фильтр устарел.", show_alert=True)
+        admin = await AdminAuthorizationService(session).require(
+            message.from_user.id, Permission.DASHBOARD
+        )
+    except AdminAccessDenied as error:
+        await message.answer(str(error))
         return
-    statement = (
-        select(Booking).options(selectinload(Booking.slot)).order_by(Booking.created_at.desc())
+    await message.answer(
+        f"Административная панель. Роль: <b>{admin.role.value}</b>",
+        reply_markup=admin_menu_keyboard(),
     )
-    now = utc_now()
-    if scope == "pending":
-        statement = statement.where(Booking.status == BookingStatus.PENDING)
-    elif scope == "confirmed":
-        statement = statement.where(Booking.status == BookingStatus.CONFIRMED)
-    elif scope == "cancelled":
-        statement = statement.where(
-            Booking.status.in_(
-                (BookingStatus.CANCELLED_BY_CLIENT, BookingStatus.CANCELLED_BY_ADMIN)
-            )
-        )
-    elif scope in {"today", "week"}:
-        end = now + (timedelta(days=1) if scope == "today" else timedelta(days=7))
-        statement = statement.join(TimeSlot).where(
-            TimeSlot.starts_at >= now, TimeSlot.starts_at < end
-        )
-    elif scope == "services":
-        service_items = list(
-            await session.scalars(select(Service).order_by(Service.sort_order).limit(20))
-        )
-        rows = [
-            [
-                InlineKeyboardButton(
-                    text=f"{'✅' if item.is_active else '⛔'} {item.name}",
-                    callback_data=AdminCallback(
-                        action="service_manage", entity_id=str(item.id)
-                    ).pack(),
-                )
-            ]
-            for item in service_items
-        ]
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-                )
-            ]
-        )
-        if callback.message:
-            await callback.message.edit_text(
-                "Услуги: выберите элемент для управления.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            )
-        await callback.answer()
-        return
-    elif scope == "faq":
-        faq_items = list(
-            await session.scalars(
-                select(FAQItem)
-                .where(FAQItem.deleted_at.is_(None))
-                .order_by(FAQItem.sort_order)
-                .limit(20)
-            )
-        )
-        rows = [
-            [
-                InlineKeyboardButton(
-                    text=f"{'✅' if item.is_active else '⛔'} {item.question}",
-                    callback_data=AdminCallback(action="faq_manage", entity_id=str(item.id)).pack(),
-                )
-            ]
-            for item in faq_items
-        ]
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-                )
-            ]
-        )
-        if callback.message:
-            await callback.message.edit_text(
-                "FAQ: выберите элемент для управления.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            )
-        await callback.answer()
-        return
-    elif scope == "schedule":
-        slot_items = list(
-            await session.scalars(
-                select(TimeSlot)
-                .where(TimeSlot.starts_at > utc_now())
-                .order_by(TimeSlot.starts_at)
-                .limit(20)
-            )
-        )
-        rows = [
-            [
-                InlineKeyboardButton(
-                    text=f"{format_studio_time(item.starts_at, 'UTC')} · {item.status.value}",
-                    callback_data=AdminCallback(
-                        action="slot_manage", entity_id=str(item.id)
-                    ).pack(),
-                )
-            ]
-            for item in slot_items
-        ]
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-                )
-            ]
-        )
-        if callback.message:
-            await callback.message.edit_text(
-                "Ближайшие слоты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-            )
-        await callback.answer()
-        return
-    elif scope == "settings":
-        if callback.message:
-            await callback.message.edit_text(
-                "Настройки студии задаются переменными окружения. Изменение не затрагивает подтверждённые записи.",
-                reply_markup=admin_menu(),
-            )
-        await callback.answer()
-        return
-    else:
-        await callback.answer("Фильтр не найден.", show_alert=True)
-        return
-    booking_items = list(
-        await session.scalars(statement.limit(PAGE_SIZE + 1).offset(page * PAGE_SIZE))
-    )
-    visible, has_next = booking_items[:PAGE_SIZE], len(booking_items) > PAGE_SIZE
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=f"#{str(item.id)[:8]} · {item.customer_name}",
-                callback_data=AdminCallback(action="view", entity_id=str(item.id)).pack(),
-            )
-        ]
-        for item in visible
-    ]
-    pager: list[InlineKeyboardButton] = []
-    if page:
-        pager.append(
-            InlineKeyboardButton(
-                text="←",
-                callback_data=AdminCallback(action="list", value=f"{scope}:{page - 1}").pack(),
-            )
-        )
-    if has_next:
-        pager.append(
-            InlineKeyboardButton(
-                text="→",
-                callback_data=AdminCallback(action="list", value=f"{scope}:{page + 1}").pack(),
-            )
-        )
-    if pager:
-        rows.append(pager)
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-            )
-        ]
-    )
-    if callback.message:
-        await callback.message.edit_text(
-            "Заявки:" if visible else "Заявок нет.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        )
-    await callback.answer()
 
 
-@router.callback_query(AdminCallback.filter(F.action == "view"))
-async def view(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession, settings: Settings
-) -> None:
-    booking = await get_booking(session, UUID(callback_data.entity_id))
-    if booking is None:
-        await callback.answer("Заявка не найдена.", show_alert=True)
-        return
-    text, owner = await card_text(session, booking, settings)
-    if callback.message:
-        await callback.message.edit_text(
-            text,
-            reply_markup=admin_card_keyboard(
-                booking.id, owner or User(telegram_id=0, first_name="Клиент")
-            ),
-        )
-    photos = list(
-        await session.scalars(
-            select(BookingPhoto)
-            .where(BookingPhoto.booking_id == booking.id)
-            .order_by(BookingPhoto.sort_order)
-        )
-    )
-    for photo in photos:
-        await callback.bot.send_photo(callback.from_user.id, photo.file_id)
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "confirm"))
-async def confirm(
+@router.callback_query(AdminPanelCallback.filter())
+async def handle_admin_section(
     callback: CallbackQuery,
-    callback_data: AdminCallback,
+    callback_data: AdminPanelCallback,
     session: AsyncSession,
-    db_user: User,
-    settings: Settings,
+    app_user: User,
 ) -> None:
-    booking = await BookingService(session).confirm(
-        UUID(callback_data.entity_id), db_user.id, settings.REMINDER_HOURS_BEFORE
-    )
-    owner = await session.get(User, booking.user_id)
-    if owner and booking.slot:
-        services = ", ".join(item.name for item in booking.services)
-        await callback.bot.send_message(
-            owner.telegram_id,
-            f"Запись подтверждена.\n{format_studio_time(booking.slot.starts_at, settings.STUDIO_TIMEZONE)}\n{settings.STUDIO_ADDRESS}\nУслуги: {services}\nТелефон: {settings.SUPPORT_PHONE}",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Моя запись",
-                            callback_data=MenuCallback(section="my_booking").pack(),
+    if callback.from_user is None:
+        return
+    permission = SECTION_PERMISSIONS.get(callback_data.section)
+    if permission is None:
+        await callback.answer("Раздел не найден", show_alert=True)
+        return
+    try:
+        await AdminAuthorizationService(session).require(
+            callback.from_user.id, permission
+        )
+    except AdminAccessDenied as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+    await callback.answer()
+    if callback.message is not None:
+        if callback_data.section == "settings":
+            await callback.message.answer(
+                "Выберите настройку:", reply_markup=content_settings_keyboard()
+            )
+            return
+        if callback_data.section == "requests":
+            requests = list(
+                (
+                    await session.execute(
+                        select(ManagerRequest)
+                        .order_by(ManagerRequest.created_at.desc())
+                        .limit(50)
+                    )
+                ).scalars()
+            )
+            if not requests:
+                await callback.message.answer("Обращений нет.")
+            for request in requests:
+                await callback.message.answer(
+                    f"#{str(request.id)[:8]} · {request.topic} · {request.status.value}",
+                    reply_markup=manager_request_keyboard(request.id),
+                )
+            return
+        entity_sections = {
+            "services": ("service", Service),
+            "prices": ("price", ServicePrice),
+            "faq": ("faq", FAQItem),
+            "calculator": ("factor", CalculationFactor),
+        }
+        if callback_data.section in entity_sections:
+            entity, model = entity_sections[callback_data.section]
+            items = list(
+                (
+                    await session.execute(
+                        select(model).order_by(model.created_at).limit(50)
+                    )
+                ).scalars()
+            )
+            await callback.message.answer(
+                "Выберите запись для редактирования:" if items else "Записей нет.",
+                reply_markup=entity_list_keyboard(entity, items) if items else None,
+            )
+            if callback_data.section == "calculator":
+                values = list(
+                    (
+                        await session.execute(
+                            select(CalculationFactorValue)
+                            .order_by(CalculationFactorValue.created_at)
+                            .limit(50)
                         )
-                    ],
+                    ).scalars()
+                )
+                if values:
+                    await callback.message.answer(
+                        "Значения факторов:",
+                        reply_markup=entity_list_keyboard("factor_value", values),
+                    )
+            return
+        await callback.message.answer(
+            f"Раздел <b>{callback_data.section}</b> доступен. "
+            "Его операции будут подключены следующими этапами."
+        )
+
+
+class ContentEditFilter(BaseFilter):
+    async def __call__(self, message: Message, app_user: User, session: AsyncSession):
+        state = await ConversationStateRepository(session).get_active_for_flow(
+            app_user.id, "content_edit", datetime.now(UTC)
+        )
+        return (
+            {"content_edit_state": state} if state and state.step == "input" else False
+        )
+
+
+@router.callback_query(ContentAdminCallback.filter())
+async def content_admin_callback(
+    callback: CallbackQuery,
+    callback_data: ContentAdminCallback,
+    app_user: User,
+    session: AsyncSession,
+):
+    try:
+        admin = await AdminAuthorizationService(session).require(
+            callback.from_user.id, Permission.MANAGE_SETTINGS
+        )
+    except AdminAccessDenied as error:
+        return await callback.answer(str(error), show_alert=True)
+    states = ConversationStateRepository(session)
+    state = await states.get_active_for_flow(
+        app_user.id, "content_edit", datetime.now(UTC)
+    )
+    if callback_data.action == "edit":
+        await states.upsert(
+            user_id=app_user.id,
+            flow="content_edit",
+            step="input",
+            payload={"key": callback_data.key},
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        await callback.answer()
+        return await callback.message.answer(
+            f"Введите новое значение: {EDITABLE_CONTENT.get(callback_data.key, callback_data.key)}"
+        )
+    if callback_data.action == "cancel":
+        if state:
+            await session.delete(state)
+        return await callback.answer("Редактирование отменено")
+    if callback_data.action == "save":
+        if (
+            state is None
+            or state.step != "confirm"
+            or state.payload.get("key") != callback_data.key
+        ):
+            return await callback.answer("Предпросмотр устарел", show_alert=True)
+        preview = await ContentAdminService(session).preview(
+            callback_data.key, state.payload["new_value"]
+        )
+        if preview.old_value != state.payload.get("old_value"):
+            return await callback.answer(
+                "Значение уже изменилось. Повторите редактирование.", show_alert=True
+            )
+        await ContentAdminService(session).save(admin, preview)
+        await session.delete(state)
+        await session.commit()
+        await callback.answer("Сохранено")
+        await callback.message.answer(
+            "Настройка сохранена, изменение записано в аудит."
+        )
+
+
+@router.message(F.text & ~F.text.startswith("/"), ContentEditFilter())
+async def content_admin_input(
+    message: Message,
+    content_edit_state: ConversationState,
+    app_user: User,
+    session: AsyncSession,
+):
+    try:
+        await AdminAuthorizationService(session).require(
+            message.from_user.id, Permission.MANAGE_SETTINGS
+        )
+    except AdminAccessDenied as error:
+        return await message.answer(str(error))
+    key = content_edit_state.payload["key"]
+    try:
+        preview = await ContentAdminService(session).preview(key, message.text)
+    except (ValueError, VehicleSelectionError) as error:
+        return await message.answer(str(error))
+    await ConversationStateRepository(session).upsert(
+        user_id=app_user.id,
+        flow="content_edit",
+        step="confirm",
+        payload={
+            "key": key,
+            "old_value": preview.old_value,
+            "new_value": preview.new_value,
+        },
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+    await message.answer(
+        f"Старое значение:\n{preview.old_value or '—'}\n\nНовое значение:\n{preview.new_value}",
+        reply_markup=content_preview_keyboard(key),
+    )
+
+
+class EntityEditFilter(BaseFilter):
+    async def __call__(self, message: Message, app_user: User, session: AsyncSession):
+        state = await ConversationStateRepository(session).get_active_for_flow(
+            app_user.id, "entity_edit", datetime.now(UTC)
+        )
+        return (
+            {"entity_edit_state": state} if state and state.step == "input" else False
+        )
+
+
+@router.callback_query(EntityAdminCallback.filter())
+async def entity_admin_callback(
+    callback: CallbackQuery,
+    callback_data: EntityAdminCallback,
+    app_user: User,
+    session: AsyncSession,
+):
+    permission = (
+        Permission.MANAGE_FAQ
+        if callback_data.entity == "faq"
+        else Permission.MANAGE_SERVICES
+        if callback_data.entity == "service"
+        else Permission.MANAGE_PRICES
+    )
+    try:
+        admin = await AdminAuthorizationService(session).require(
+            callback.from_user.id, permission
+        )
+    except AdminAccessDenied as error:
+        return await callback.answer(str(error), show_alert=True)
+    states = ConversationStateRepository(session)
+    state = await states.get_active_for_flow(
+        app_user.id, "entity_edit", datetime.now(UTC)
+    )
+    if callback_data.action == "edit":
+        await states.upsert(
+            user_id=app_user.id,
+            flow="entity_edit",
+            step="input",
+            payload={
+                "entity": callback_data.entity,
+                "entity_id": str(callback_data.entity_id),
+            },
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        await callback.answer()
+        return await callback.message.answer(
+            'Введите изменяемые поля в JSON, например: {"name":"Новое название"}'
+        )
+    if callback_data.action == "cancel":
+        if state:
+            await session.delete(state)
+        return await callback.answer("Редактирование отменено")
+    if callback_data.action == "save":
+        if state is None or state.step != "confirm":
+            return await callback.answer("Предпросмотр устарел", show_alert=True)
+        try:
+            await EntityAdminService(session).save(
+                admin,
+                callback_data.entity,
+                callback_data.entity_id,
+                state.payload["updates"],
+                state.payload["old"],
+            )
+        except ValueError as error:
+            return await callback.answer(str(error), show_alert=True)
+        await session.delete(state)
+        await session.commit()
+        await callback.answer("Сохранено")
+        await callback.message.answer("Изменение сохранено и записано в аудит.")
+
+
+@router.message(F.text & ~F.text.startswith("/"), EntityEditFilter())
+async def entity_admin_input(
+    message: Message,
+    entity_edit_state: ConversationState,
+    app_user: User,
+    session: AsyncSession,
+):
+    try:
+        updates = json.loads(message.text or "")
+    except json.JSONDecodeError:
+        return await message.answer("Некорректный JSON.")
+    if not isinstance(updates, dict) or not updates:
+        return await message.answer("Укажите хотя бы одно поле.")
+    entity = entity_edit_state.payload["entity"]
+    entity_id = UUID(entity_edit_state.payload["entity_id"])
+    permission = (
+        Permission.MANAGE_FAQ
+        if entity == "faq"
+        else Permission.MANAGE_SERVICES
+        if entity == "service"
+        else Permission.MANAGE_PRICES
+    )
+    try:
+        await AdminAuthorizationService(session).require(
+            message.from_user.id, permission
+        )
+        _, converted, old, new = await EntityAdminService(session).preview(
+            entity, entity_id, updates
+        )
+    except (AdminAccessDenied, ValueError) as error:
+        return await message.answer(str(error))
+    serializable_updates = {
+        k: (str(v) if hasattr(v, "as_tuple") else v) for k, v in converted.items()
+    }
+    await ConversationStateRepository(session).upsert(
+        user_id=app_user.id,
+        flow="entity_edit",
+        step="confirm",
+        payload={
+            "entity": entity,
+            "entity_id": str(entity_id),
+            "updates": serializable_updates,
+            "old": old,
+            "new": new,
+        },
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+    await message.answer(
+        f"Старое значение:\n{json.dumps(old, ensure_ascii=False, indent=2)}\n\nНовое значение:\n{json.dumps(new, ensure_ascii=False, indent=2)}",
+        reply_markup=entity_preview_keyboard(entity, entity_id),
+    )
+
+
+@router.callback_query(AdminApplicationCallback.filter())
+async def handle_admin_application_action(
+    callback: CallbackQuery,
+    callback_data: AdminApplicationCallback,
+    session: AsyncSession,
+    settings: Settings,
+    bot: Bot,
+) -> None:
+    permission = APPLICATION_ACTION_PERMISSIONS.get(callback_data.action)
+    if permission is None:
+        await callback.answer("Действие не найдено", show_alert=True)
+        return
+    try:
+        admin = await AdminAuthorizationService(session).require(
+            callback.from_user.id, permission
+        )
+    except AdminAccessDenied as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+
+    if callback.message is None:
+        return
+    if callback_data.action == "confirm":
+        try:
+            result = await AdminAppointmentService(session).confirm(
+                admin,
+                callback_data.appointment_id,
+                await effective_reminder_hours(session, settings.reminder_hours),
+            )
+            user = await session.get(User, result.appointment.user_id)
+            await session.commit()
+            delivered = True
+            if user is not None:
+                try:
+                    await ClientNotificationService(
+                        session, bot, settings
+                    ).send_confirmation(result.appointment, user)
+                except TelegramAPIError:
+                    delivered = False
+            await callback.answer("Заявка подтверждена")
+            suffix = "" if delivered else " Уведомить клиента не удалось."
+            await callback.message.answer(
+                f"Заявка подтверждена. Создано напоминаний: {result.reminders_created}.{suffix}"
+            )
+        except VehicleSelectionError as error:
+            await callback.answer(str(error), show_alert=True)
+        return
+    if callback_data.action == "reject":
+        await callback.answer()
+        await callback.message.answer(
+            "Выберите причину отклонения:",
+            reply_markup=rejection_reasons_keyboard(callback_data.appointment_id),
+        )
+        return
+    if callback_data.action == "reschedule":
+        now = datetime.now(UTC)
+        app_user = await session.scalar(
+            select(User).where(User.telegram_id == callback.from_user.id)
+        )
+        if app_user is None:
+            await callback.answer(
+                "Пользователь администратора не найден", show_alert=True
+            )
+            return
+        await ConversationStateRepository(session).upsert(
+            user_id=app_user.id,
+            flow=ADMIN_CHANGE_FLOW,
+            step="select_slot",
+            payload={"appointment_id": str(callback_data.appointment_id)},
+            expires_at=now + timedelta(minutes=30),
+        )
+        slots = await AvailableSlotRepository(session).list_available_between(
+            now, now + timedelta(days=settings.booking_days_ahead + 1), now
+        )
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=slot.starts_at.astimezone(settings.app_timezone).strftime(
+                        "%d.%m %H:%M"
+                    ),
+                    callback_data=AdminChangeCallback(
+                        action="slot",
+                        value=str(slot.id),
+                    ).pack(),
+                )
+            ]
+            for slot in slots[:20]
+        ]
+        if slots:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="Предложить ближайшие варианты клиенту",
+                        callback_data=AdminChangeCallback(action="offer").pack(),
+                    )
+                ]
+            )
+        await callback.answer()
+        await callback.message.answer(
+            "Выберите новый слот:" if rows else "Свободных слотов нет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
+        )
+        return
+
+    appointment = await session.get(Appointment, callback_data.appointment_id)
+    if appointment is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await callback.answer()
+    if callback_data.action == "open":
+        user = await session.get(User, appointment.user_id)
+        if user is None:
+            await callback.message.answer("Пользователь заявки не найден.")
+            return
+        summary = await ApplicationSummaryService(session).for_appointment(
+            appointment, user
+        )
+        admin_user = await session.scalar(
+            select(User).where(User.telegram_id == callback.from_user.id)
+        )
+        if admin_user is not None:
+            await ConversationStateRepository(session).upsert(
+                user_id=admin_user.id,
+                flow=ADMIN_CHANGE_FLOW,
+                step="manage",
+                payload={"appointment_id": str(appointment.id)},
+                expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            )
+        management = None
+        if appointment.status == AppointmentStatus.CONFIRMED:
+            management = InlineKeyboardMarkup(
+                inline_keyboard=[
                     [
                         InlineKeyboardButton(
                             text="Перенести",
-                            callback_data=BookingCallback(action="reschedule").pack(),
-                        ),
-                        InlineKeyboardButton(
-                            text="Отменить",
-                            callback_data=BookingCallback(action="cancel_booking").pack(),
-                        ),
+                            callback_data=AdminApplicationCallback(
+                                action="reschedule", appointment_id=appointment.id
+                            ).pack(),
+                        )
                     ],
                     [
                         InlineKeyboardButton(
-                            text="Связаться с менеджером",
-                            callback_data=MenuCallback(section="manager").pack(),
+                            text="Отменить запись",
+                            callback_data=AdminChangeCallback(
+                                action="cancel", value="Отмена администратором"
+                            ).pack(),
                         )
                     ],
                 ]
-            ),
+            )
+        await callback.message.answer(
+            build_admin_application_text(summary, settings), reply_markup=management
         )
-    if callback.message:
-        await callback.message.edit_text("Запись подтверждена.", reply_markup=admin_menu())
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "reject"))
-async def reject(callback: CallbackQuery, callback_data: AdminCallback) -> None:
-    booking_id = callback_data.entity_id
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text="Время недоступно",
-                callback_data=AdminCallback(
-                    action="reject_reason", entity_id=booking_id, value="time"
-                ).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="Услуга недоступна",
-                callback_data=AdminCallback(
-                    action="reject_reason", entity_id=booking_id, value="service"
-                ).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="Не удалось связаться",
-                callback_data=AdminCallback(
-                    action="reject_reason", entity_id=booking_id, value="contact"
-                ).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="Другая причина",
-                callback_data=AdminCallback(
-                    action="reject_reason", entity_id=booking_id, value="other"
-                ).pack(),
-            )
-        ],
-    ]
-    if callback.message:
-        await callback.message.edit_text(
-            "Выберите причину отклонения:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    else:
+        await callback.message.answer(
+            "Право подтверждено сервером. Действие "
+            f"<b>{callback_data.action}</b> пока недоступно."
         )
-    await callback.answer()
 
 
-@router.callback_query(AdminCallback.filter(F.action == "reject_reason"))
-async def reject_reason(
+@router.callback_query(AdminChangeCallback.filter())
+async def handle_admin_change(
     callback: CallbackQuery,
-    callback_data: AdminCallback,
-    state: FSMContext,
-    session: AsyncSession,
-    db_user: User,
-) -> None:
-    reasons = {
-        "time": "Время недоступно",
-        "service": "Услуга временно недоступна",
-        "contact": "Не удалось связаться",
-    }
-    if callback_data.value == "other":
-        await state.update_data(admin_reject_booking_id=callback_data.entity_id)
-        await state.set_state(AdminStates.rejection_reason)
-        if callback.message:
-            await callback.message.edit_text("Напишите причину для внутреннего журнала:")
-        await callback.answer()
-        return
-    booking = await BookingService(session).change_status(
-        UUID(callback_data.entity_id),
-        BookingStatus.CANCELLED_BY_ADMIN,
-        db_user.id,
-        reasons[callback_data.value],
-    )
-    owner = await session.get(User, booking.user_id)
-    if owner:
-        await callback.bot.send_message(
-            owner.telegram_id,
-            "К сожалению, сейчас не можем подтвердить запись. Выберите другое время или свяжитесь с менеджером.",
-        )
-    if callback.message:
-        await callback.message.edit_text("Заявка отклонена.", reply_markup=admin_menu())
-    await callback.answer()
-
-
-@router.message(AdminStates.rejection_reason)
-async def reject_other(
-    message: Message, state: FSMContext, session: AsyncSession, db_user: User
-) -> None:
-    reason = (message.text or "").strip()
-    data = await state.get_data()
-    booking_id = data.get("admin_reject_booking_id")
-    if not reason or not booking_id:
-        await message.answer("Укажите причину отклонения.")
-        return
-    booking = await BookingService(session).change_status(
-        UUID(booking_id), BookingStatus.CANCELLED_BY_ADMIN, db_user.id, reason
-    )
-    owner = await session.get(User, booking.user_id)
-    if owner:
-        await message.bot.send_message(
-            owner.telegram_id,
-            "К сожалению, сейчас не можем подтвердить запись. Выберите другое время или свяжитесь с менеджером.",
-        )
-    await state.clear()
-    await message.answer("Заявка отклонена.", reply_markup=admin_menu())
-
-
-@router.callback_query(AdminCallback.filter(F.action == "history"))
-async def history(
-    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
-) -> None:
-    rows = list(
-        await session.scalars(
-            select(AuditLog)
-            .where(
-                AuditLog.entity_type == "booking",
-                AuditLog.entity_id == UUID(callback_data.entity_id),
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(20)
-        )
-    )
-    text = (
-        "\n".join(f"{item.created_at:%d.%m %H:%M} — {item.action}" for item in rows)
-        or "История пока пуста."
-    )
-    if callback.message:
-        await callback.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-                        )
-                    ]
-                ]
-            ),
-        )
-    await callback.answer()
-
-
-@router.callback_query(AdminCallback.filter(F.action == "propose"))
-async def propose(
-    callback: CallbackQuery,
-    callback_data: AdminCallback,
-    state: FSMContext,
+    callback_data: AdminChangeCallback,
+    app_user: User,
     session: AsyncSession,
     settings: Settings,
+    bot: Bot,
 ) -> None:
-    slots = list(
-        await session.scalars(
-            select(TimeSlot)
-            .where(TimeSlot.status == SlotStatus.AVAILABLE, TimeSlot.starts_at > utc_now())
-            .order_by(TimeSlot.starts_at)
-            .limit(12)
-        )
-    )
-    await state.update_data(admin_reschedule_booking_id=callback_data.entity_id)
-    await state.set_state(AdminStates.reschedule_slot)
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text=format_studio_time(slot.starts_at, settings.STUDIO_TIMEZONE),
-                callback_data=AdminCallback(action="offer_slot", entity_id=str(slot.id)).pack(),
-            )
-        ]
-        for slot in slots
-    ]
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
-            )
-        ]
-    )
-    if callback.message:
-        await callback.message.edit_text(
-            "Выберите новое время:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-        )
-    await callback.answer()
-
-
-@router.callback_query(AdminStates.reschedule_slot, AdminCallback.filter(F.action == "offer_slot"))
-async def offer_slot(
-    callback: CallbackQuery,
-    callback_data: AdminCallback,
-    state: FSMContext,
-    session: AsyncSession,
-    db_user: User,
-    settings: Settings,
-) -> None:
-    data = await state.get_data()
-    booking_id = data.get("admin_reschedule_booking_id")
-    if not booking_id:
-        await callback.answer("Выберите заявку заново.", show_alert=True)
-        return
     try:
-        booking = await BookingService(session).propose_reschedule(
-            UUID(booking_id), UUID(callback_data.entity_id), db_user.id
+        admin = await AdminAuthorizationService(session).require(
+            callback.from_user.id, Permission.MANAGE_APPOINTMENTS
         )
-    except (LookupError, SlotUnavailableError, InvalidTransitionError) as error:
+    except AdminAccessDenied as error:
         await callback.answer(str(error), show_alert=True)
         return
-    owner = await session.get(User, booking.user_id)
-    slot = await session.get(TimeSlot, booking.proposed_slot_id)
-    if owner and slot:
-        await callback.bot.send_message(
-            owner.telegram_id,
-            f"Студия предлагает другое время: {format_studio_time(slot.starts_at, settings.STUDIO_TIMEZONE)}. Подходит?",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Подходит",
-                            callback_data=BookingCallback(
-                                action="offer_accept", value=str(booking.id)
-                            ).pack(),
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="Выбрать другое время",
-                            callback_data=BookingCallback(
-                                action="offer_decline", value=str(booking.id)
-                            ).pack(),
-                        )
-                    ],
-                ]
+    if callback.message is None:
+        return
+    service = AppointmentChangeService(
+        session,
+        deadline_hours=settings.appointment_change_deadline_hours,
+        reservation_minutes=settings.slot_reservation_minutes,
+    )
+    try:
+        state = await ConversationStateRepository(session).get_active_for_flow(
+            app_user.id, ADMIN_CHANGE_FLOW, datetime.now(UTC)
+        )
+        if state is None:
+            raise VehicleSelectionError("Сценарий изменения записи истёк.")
+        appointment_id = UUID(str(state.payload.get("appointment_id")))
+        if callback_data.action == "slot":
+            await service.reserve_new_slot(
+                admin, appointment_id, UUID(callback_data.value), as_admin=True
+            )
+            await callback.answer()
+            await callback.message.answer(
+                "Новый слот временно зарезервирован.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Подтвердить перенос",
+                                callback_data=AdminChangeCallback(
+                                    action="confirm"
+                                ).pack(),
+                            )
+                        ]
+                    ]
+                ),
+            )
+        elif callback_data.action == "confirm":
+            appointment = await session.get(Appointment, appointment_id)
+            await service.confirm_reschedule(
+                admin,
+                appointment_id,
+                reminder_hours=await effective_reminder_hours(
+                    session, settings.reminder_hours
+                ),
+                as_admin=True,
+            )
+            await session.commit()
+            if appointment is not None:
+                user = await session.get(User, appointment.user_id)
+                if user is not None:
+                    await bot.send_message(
+                        user.telegram_id,
+                        f"Администратор перенёс запись на {appointment.scheduled_at.astimezone(settings.app_timezone):%d.%m.%Y %H:%M}.",
+                    )
+            await callback.answer("Запись перенесена")
+            await callback.message.answer("Запись перенесена, напоминания обновлены.")
+        elif callback_data.action == "cancel":
+            reason = clean_user_text(callback_data.value, min_length=2, max_length=500)
+            appointment = await session.get(Appointment, appointment_id)
+            await service.cancel(admin, appointment_id, reason, as_admin=True)
+            await session.commit()
+            if appointment is not None:
+                user = await session.get(User, appointment.user_id)
+                if user is not None:
+                    await bot.send_message(
+                        user.telegram_id,
+                        f"Запись отменена администратором. Причина: {reason}",
+                    )
+            await callback.answer("Запись отменена")
+        elif callback_data.action == "offer":
+            appointment = await session.get(Appointment, appointment_id)
+            if appointment is None:
+                raise VehicleSelectionError("Запись не найдена.")
+            user = await session.get(User, appointment.user_id)
+            now = datetime.now(UTC)
+            slots = await AvailableSlotRepository(session).list_available_between(
+                now, now + timedelta(days=settings.booking_days_ahead + 1), now
+            )
+            if user is None or not slots:
+                raise VehicleSelectionError("Клиент или свободные варианты не найдены.")
+            variants = "\n".join(
+                f"• {slot.starts_at.astimezone(settings.app_timezone):%d.%m.%Y %H:%M}"
+                for slot in slots[:3]
+            )
+            await bot.send_message(
+                user.telegram_id,
+                "Администратор предлагает другие варианты времени:\n"
+                f"{variants}\n\nДля выбора свяжитесь с менеджером.",
+            )
+            await callback.answer("Варианты отправлены")
+    except (VehicleSelectionError, ValueError) as error:
+        await callback.answer(str(error), show_alert=True)
+
+
+class AdminRejectInputFilter(BaseFilter):
+    async def __call__(
+        self,
+        message: Message,
+        app_user: User,
+        session: AsyncSession,
+    ) -> bool | dict:
+        state = await ConversationStateRepository(session).get_active_for_flow(
+            app_user.id, ADMIN_REJECT_FLOW, datetime.now(UTC)
+        )
+        if state is None or state.step != "reason_input":
+            return False
+        return {"admin_reject_state": state}
+
+
+async def _require_manage_appointment(telegram_id: int, session: AsyncSession):
+    return await AdminAuthorizationService(session).require(
+        telegram_id, Permission.MANAGE_APPOINTMENTS
+    )
+
+
+@router.callback_query(RejectAppointmentCallback.filter())
+async def handle_rejection_callback(
+    callback: CallbackQuery,
+    callback_data: RejectAppointmentCallback,
+    app_user: User,
+    session: AsyncSession,
+    settings: Settings,
+    bot: Bot,
+) -> None:
+    try:
+        admin = await _require_manage_appointment(callback.from_user.id, session)
+    except AdminAccessDenied as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+    if callback.message is None:
+        return
+    states = ConversationStateRepository(session)
+    if callback_data.action == "preview":
+        reason = TYPICAL_REJECTION_REASONS.get(callback_data.reason)
+        if reason is None:
+            await callback.answer("Причина не найдена", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(
+            f"Причина: <b>{reason}</b>\nПодтвердите действие.",
+            reply_markup=rejection_confirmation_keyboard(
+                callback_data.appointment_id, callback_data.reason
             ),
         )
-    await state.clear()
-    if callback.message:
-        await callback.message.edit_text(
-            "Предложение отправлено клиенту.", reply_markup=admin_menu()
+        return
+    if callback_data.action == "custom":
+        await states.upsert(
+            user_id=app_user.id,
+            flow=ADMIN_REJECT_FLOW,
+            step="reason_input",
+            payload={"appointment_id": str(callback_data.appointment_id)},
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
         )
-    await callback.answer()
+        await callback.answer()
+        await callback.message.answer("Введите причину отклонения:")
+        return
+    if callback_data.action == "abort":
+        state = await states.get_for_flow(app_user.id, ADMIN_REJECT_FLOW)
+        if state is not None:
+            await session.delete(state)
+        await callback.answer("Отклонение отменено")
+        return
+    if callback_data.action != "confirm":
+        await callback.answer("Действие не найдено", show_alert=True)
+        return
+
+    if callback_data.reason == "custom":
+        state = await states.get_active_for_flow(
+            app_user.id, ADMIN_REJECT_FLOW, datetime.now(UTC)
+        )
+        if (
+            state is None
+            or state.step != "reason_confirm"
+            or state.payload.get("appointment_id") != str(callback_data.appointment_id)
+        ):
+            await callback.answer("Причина устарела", show_alert=True)
+            return
+        reason = str(state.payload.get("reason", ""))
+    else:
+        reason = TYPICAL_REJECTION_REASONS.get(callback_data.reason, "")
+    if not reason:
+        await callback.answer("Причина не найдена", show_alert=True)
+        return
+    try:
+        result = await AdminAppointmentService(session).reject(
+            admin, callback_data.appointment_id, reason
+        )
+        state = await states.get_for_flow(app_user.id, ADMIN_REJECT_FLOW)
+        if state is not None:
+            await session.delete(state)
+        user = await session.get(User, result.appointment.user_id)
+        await session.commit()
+        delivered = True
+        if user is not None:
+            try:
+                await ClientNotificationService(session, bot, settings).send_rejection(
+                    result.appointment, user
+                )
+            except TelegramAPIError:
+                delivered = False
+        await callback.answer("Заявка отклонена")
+        suffix = "" if delivered else " Уведомить клиента не удалось."
+        await callback.message.answer(
+            f"Заявка отклонена. Отменено напоминаний: {result.reminders_cancelled}.{suffix}"
+        )
+    except VehicleSelectionError as error:
+        await callback.answer(str(error), show_alert=True)
+
+
+@router.message(F.text & ~F.text.startswith("/"), AdminRejectInputFilter())
+async def receive_custom_rejection_reason(
+    message: Message,
+    admin_reject_state: ConversationState,
+    session: AsyncSession,
+) -> None:
+    if message.from_user is None:
+        return
+    try:
+        await _require_manage_appointment(message.from_user.id, session)
+        reason = clean_user_text(message.text, min_length=2, max_length=500)
+    except (AdminAccessDenied, VehicleSelectionError) as error:
+        await message.answer(str(error))
+        return
+    appointment_id = admin_reject_state.payload.get("appointment_id")
+    try:
+        appointment_uuid = UUID(str(appointment_id))
+    except (TypeError, ValueError):
+        await message.answer("Состояние отклонения повреждено.")
+        return
+    await ConversationStateRepository(session).upsert(
+        user_id=admin_reject_state.user_id,
+        flow=ADMIN_REJECT_FLOW,
+        step="reason_confirm",
+        payload={"appointment_id": str(appointment_uuid), "reason": reason},
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+    await message.answer(
+        f"Причина: <b>{reason}</b>\nПодтвердите действие.",
+        reply_markup=rejection_confirmation_keyboard(appointment_uuid, "custom"),
+    )

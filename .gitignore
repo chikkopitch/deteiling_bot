@@ -1,11 +1,32 @@
+# Secrets
 .env
-.venv/
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+
+# Tests and tooling
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.xml
 htmlcov/
-*.zip
 
+# IDE and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime files
+*.log
+logs/
+backups/

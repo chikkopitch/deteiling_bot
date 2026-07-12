@@ -1,0 +1,8 @@
+aiogram>=3.29.1,<4.0
+SQLAlchemy>=2.0.51,<3.0
+asyncpg>=0.30.0,<1.0
+alembic>=1.18.5,<2.0
+pydantic-settings>=2.10.0,<3.0
+tzdata>=2025.2
+pytest>=8.4.0,<10.0
+pytest-asyncio>=1.4.0,<2.0

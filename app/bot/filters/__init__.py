@@ -1,3 +1,5 @@
-from app.bot.filters.admin import IsAdmin
+"""Custom Aiogram filters."""
 
-__all__ = ["IsAdmin"]
+from app.bot.filters.conversation import ConversationStepFilter
+
+__all__ = ["ConversationStepFilter"]

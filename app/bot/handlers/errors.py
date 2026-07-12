@@ -1,21 +1,43 @@
-import structlog
-from aiogram import Router
-from aiogram.types import ErrorEvent, Message
+"""Last-resort Aiogram update error handler."""
 
-log = structlog.get_logger()
-router = Router(name="errors")
+from __future__ import annotations
+
+import logging
+from uuid import uuid4
+
+from aiogram.types import ErrorEvent
+
+logger = logging.getLogger(__name__)
 
 
-@router.errors()
-async def global_error_handler(event: ErrorEvent) -> bool:
-    """Log internal details and show users a neutral message."""
-    await log.aexception("telegram_update_failed", error_type=type(event.exception).__name__)
+async def handle_update_error(event: ErrorEvent) -> bool:
+    """Log an unexpected update failure and return a safe response."""
+    error_id = uuid4().hex[:12]
+    logger.error(
+        "Unhandled Telegram update error; error_id=%s update_id=%s",
+        error_id,
+        event.update.update_id,
+        exc_info=(
+            type(event.exception),
+            event.exception,
+            event.exception.__traceback__,
+        ),
+    )
+
     message = event.update.message
-    callback = event.update.callback_query
-    if message is None and callback is not None and isinstance(callback.message, Message):
-        message = callback.message
-    if message:
-        await message.answer("Произошла временная ошибка. Пожалуйста, повторите попытку позже.")
-    if callback:
-        await callback.answer()
+    if message is None and event.update.callback_query is not None:
+        message = event.update.callback_query.message
+
+    if message is not None:
+        try:
+            await message.answer(
+                "Произошла внутренняя ошибка. Попробуйте ещё раз. "
+                f"Код ошибки: <code>{error_id}</code>"
+            )
+        except Exception:
+            logger.warning(
+                "Could not send error response; error_id=%s",
+                error_id,
+                exc_info=True,
+            )
     return True
