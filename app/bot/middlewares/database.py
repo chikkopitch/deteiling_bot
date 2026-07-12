@@ -5,6 +5,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 
 from app.database import Database
+from app.repositories import UserRepository
 
 
 class DatabaseMiddleware(BaseMiddleware):
@@ -19,4 +20,10 @@ class DatabaseMiddleware(BaseMiddleware):
     ) -> Any:
         async with self.database.session_factory() as session:
             data["session"] = session
+            user = getattr(event, "from_user", None)
+            if user:
+                data["db_user"] = await UserRepository(session).upsert_telegram(
+                    user.id, user.username, user.first_name, user.last_name
+                )
+                await session.commit()
             return await handler(event, data)

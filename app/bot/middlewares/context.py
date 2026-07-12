@@ -9,8 +9,6 @@ from aiogram.types import TelegramObject
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from app.repositories import UserRepository
-
 log = structlog.get_logger()
 
 
@@ -39,13 +37,6 @@ class ContextMiddleware(BaseMiddleware):
     ) -> Any:
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(correlation_id=str(uuid4()))
-        user = getattr(event, "from_user", None)
-        session = data.get("session")
-        if user and session:
-            data["db_user"] = await UserRepository(session).upsert_telegram(
-                user.id, user.username, user.first_name, user.last_name
-            )
-            await session.commit()
         return await handler(event, data)
 
 
