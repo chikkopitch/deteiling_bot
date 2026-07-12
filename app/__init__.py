@@ -1,0 +1,1 @@
+"""Detailing studio Telegram bot."""
