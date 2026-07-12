@@ -11,4 +11,4 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-CMD ["python", "start.py"]
+CMD ["sh", "-c", "python -m alembic upgrade head && python scripts/seed_initial_data.py && python scripts/create_owner.py && exec python start.py"]
