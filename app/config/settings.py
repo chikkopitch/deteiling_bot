@@ -36,6 +36,11 @@ class Settings(BaseSettings):
             return tuple(int(item.strip()) for item in value.split(",") if item.strip())
         return value
 
+    @field_validator("REDIS_URL", mode="before")
+    @classmethod
+    def normalize_optional_redis_url(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
+
     @field_validator("STUDIO_TIMEZONE")
     @classmethod
     def validate_timezone(cls, value: str) -> str:
