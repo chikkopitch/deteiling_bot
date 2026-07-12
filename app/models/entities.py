@@ -195,8 +195,8 @@ class Booking(UUIDMixin, TimestampMixin, Base):
 class BookingPhoto(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "booking_photos"
     __table_args__ = (
-        UniqueConstraint("booking_id", "unique_file_id"),
-        UniqueConstraint("booking_id", "sort_order"),
+        UniqueConstraint("booking_id", "unique_file_id", name="uq_booking_photos_file_id"),
+        UniqueConstraint("booking_id", "sort_order", name="uq_booking_photos_sort_order"),
         CheckConstraint("size_bytes >= 0", name="nonnegative_size"),
     )
     booking_id: Mapped[UUID] = mapped_column(ForeignKey("bookings.id", ondelete="CASCADE"))
