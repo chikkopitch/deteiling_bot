@@ -25,6 +25,11 @@ from app.bot.keyboards.admin import (
     AdminPanelCallback,
     admin_menu_keyboard,
 )
+from app.bot.keyboards.admin_schedule import (
+    AdminScheduleCallback,
+    admin_schedule_keyboard,
+    admin_schedule_slots_keyboard,
+)
 from app.bot.keyboards.appointment_actions import (
     RejectAppointmentCallback,
     TYPICAL_REJECTION_REASONS,
@@ -75,11 +80,18 @@ from app.bot.keyboards.entity_admin import (
 )
 from app.bot.keyboards.manager import manager_request_keyboard
 from app.services.entity_admin import EntityAdminService
+from app.services.admin_schedule import (
+    AdminScheduleError,
+    AdminScheduleService,
+    parse_slot_drafts,
+)
 from app.services.vehicle_selection import VehicleSelectionError, clean_user_text
 
 router = Router(name="admin")
 ADMIN_REJECT_FLOW = "admin_reject"
 ADMIN_CHANGE_FLOW = "admin_change"
+ADMIN_SCHEDULE_FLOW = "admin_schedule"
+ADMIN_SCHEDULE_STATE_TTL = timedelta(minutes=30)
 
 SECTION_PERMISSIONS = {
     "admins": Permission.MANAGE_ADMINS,
@@ -134,6 +146,7 @@ async def handle_admin_section(
     callback_data: AdminPanelCallback,
     session: AsyncSession,
     app_user: User,
+    settings: Settings,
 ) -> None:
     if callback.from_user is None:
         return
@@ -150,6 +163,12 @@ async def handle_admin_section(
         return
     await callback.answer()
     if callback.message is not None:
+        if callback_data.section == "schedule":
+            await show_admin_schedule_menu(callback.message)
+            return
+        if callback_data.section == "free_slots":
+            await show_admin_schedule_slots(callback.message, session, settings)
+            return
         if callback_data.section == "settings":
             await callback.message.answer(
                 "Выберите настройку:", reply_markup=content_settings_keyboard()
@@ -212,6 +231,144 @@ async def handle_admin_section(
             f"Раздел <b>{callback_data.section}</b> доступен. "
             "Его операции будут подключены следующими этапами."
         )
+
+
+async def show_admin_schedule_menu(message: Message) -> None:
+    await message.answer(
+        "<b>Расписание</b>\n\n"
+        "Добавляйте доступные слоты — пользователи увидят их в календаре записи. "
+        "Один слот: <code>15.07.2026 10:00 120</code>, где последнее число — "
+        "длительность в минутах. Можно отправить несколько строк за раз.",
+        reply_markup=admin_schedule_keyboard(),
+    )
+
+
+async def show_admin_schedule_slots(
+    message: Message, session: AsyncSession, settings: Settings
+) -> None:
+    slots = await AdminScheduleService(session).list_open_slots()
+    if not slots:
+        await message.answer(
+            "Открытых будущих слотов пока нет.",
+            reply_markup=admin_schedule_keyboard(),
+        )
+        return
+    await message.answer(
+        "Ближайшие открытые слоты. Нажмите на слот, чтобы закрыть его для новых записей.",
+        reply_markup=admin_schedule_slots_keyboard(slots, settings.app_timezone),
+    )
+
+
+@router.callback_query(AdminScheduleCallback.filter())
+async def handle_admin_schedule_callback(
+    callback: CallbackQuery,
+    callback_data: AdminScheduleCallback,
+    app_user: User,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    if callback.from_user is None or callback.message is None:
+        return
+    try:
+        admin = await AdminAuthorizationService(session).require(
+            callback.from_user.id, Permission.MANAGE_SCHEDULE
+        )
+    except AdminAccessDenied as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+
+    states = ConversationStateRepository(session)
+    if callback_data.action == "menu":
+        state = await states.get_active_for_flow(
+            app_user.id, ADMIN_SCHEDULE_FLOW, datetime.now(UTC)
+        )
+        if state is not None:
+            await session.delete(state)
+        await callback.answer()
+        await show_admin_schedule_menu(callback.message)
+        return
+    if callback_data.action == "add":
+        await states.upsert(
+            user_id=app_user.id,
+            flow=ADMIN_SCHEDULE_FLOW,
+            step="slot_input",
+            payload={},
+            expires_at=datetime.now(UTC) + ADMIN_SCHEDULE_STATE_TTL,
+        )
+        await callback.answer()
+        await callback.message.answer(
+            "Отправьте слоты отдельными строками в формате:\n"
+            "<code>ДД.ММ.ГГГГ ЧЧ:ММ ДЛИТЕЛЬНОСТЬ_В_МИНУТАХ</code>\n\n"
+            "Например:\n<code>15.07.2026 10:00 120\n15.07.2026 13:00 120</code>"
+        )
+        return
+    if callback_data.action == "list":
+        await callback.answer()
+        await show_admin_schedule_slots(callback.message, session, settings)
+        return
+    if callback_data.action == "close":
+        try:
+            slot_id = UUID(callback_data.value)
+            slot = await AdminScheduleService(session).close_slot(admin, slot_id)
+            await session.commit()
+        except (AdminScheduleError, ValueError) as error:
+            await callback.answer(str(error), show_alert=True)
+            return
+        await callback.answer("Слот закрыт")
+        starts_at = slot.starts_at.astimezone(settings.app_timezone)
+        await callback.message.answer(
+            f"Слот {starts_at:%d.%m.%Y %H:%M} закрыт для новых записей."
+        )
+        await show_admin_schedule_slots(callback.message, session, settings)
+        return
+    await callback.answer("Действие устарело", show_alert=True)
+
+
+class AdminScheduleInputFilter(BaseFilter):
+    async def __call__(self, message: Message, app_user: User, session: AsyncSession):
+        state = await ConversationStateRepository(session).get_active_for_flow(
+            app_user.id, ADMIN_SCHEDULE_FLOW, datetime.now(UTC)
+        )
+        return (
+            {"admin_schedule_state": state}
+            if state is not None and state.step == "slot_input"
+            else False
+        )
+
+
+@router.message(F.text & ~F.text.startswith("/"), AdminScheduleInputFilter())
+async def handle_admin_schedule_input(
+    message: Message,
+    admin_schedule_state: ConversationState,
+    app_user: User,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    if message.from_user is None:
+        return
+    try:
+        admin = await AdminAuthorizationService(session).require(
+            message.from_user.id, Permission.MANAGE_SCHEDULE
+        )
+        drafts = parse_slot_drafts(
+            message.text or "",
+            timezone=settings.app_timezone,
+            booking_days_ahead=settings.booking_days_ahead,
+        )
+        slots = await AdminScheduleService(session).create_slots(admin, drafts)
+    except (AdminAccessDenied, AdminScheduleError) as error:
+        await message.answer(str(error))
+        return
+    await session.delete(admin_schedule_state)
+    await session.commit()
+    local_slots = [slot.starts_at.astimezone(settings.app_timezone) for slot in slots]
+    rendered = "\n".join(
+        f"• {slot:%d.%m.%Y %H:%M}" for slot in local_slots
+    )
+    await message.answer(
+        f"Добавлено слотов: <b>{len(slots)}</b>.\n{rendered}",
+        reply_markup=admin_schedule_keyboard(),
+    )
 
 
 class ContentEditFilter(BaseFilter):
