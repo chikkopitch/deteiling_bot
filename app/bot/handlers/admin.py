@@ -18,8 +18,10 @@ from app.models import (
     Booking,
     BookingPhoto,
     BookingStatus,
+    FAQItem,
     ManagerRequest,
     ManagerRequestStatus,
+    Service,
     SlotStatus,
     TimeSlot,
     User,
@@ -261,6 +263,154 @@ async def manager_close(
     await callback.answer()
 
 
+@router.callback_query(AdminCallback.filter(F.action == "service_manage"))
+async def service_manage(
+    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
+) -> None:
+    item = await session.get(Service, UUID(callback_data.entity_id))
+    if item is None:
+        await callback.answer("Услуга не найдена.", show_alert=True)
+        return
+    text = f"{item.name}\nЦена от: {item.price_from} ₽\nДлительность: {item.duration_minutes} мин.\nАктивна: {'да' if item.is_active else 'нет'}"
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="Включить/выключить",
+                callback_data=AdminCallback(action="service_toggle", entity_id=str(item.id)).pack(),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Удалить",
+                callback_data=AdminCallback(action="service_delete", entity_id=str(item.id)).pack(),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
+            )
+        ],
+    ]
+    if callback.message:
+        await callback.message.edit_text(
+            text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+    await callback.answer()
+
+
+@router.callback_query(AdminCallback.filter(F.action.in_({"service_toggle", "service_delete"})))
+async def service_mutate(
+    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession, db_user: User
+) -> None:
+    item = await session.get(Service, UUID(callback_data.entity_id))
+    if item is None:
+        await callback.answer("Услуга не найдена.", show_alert=True)
+        return
+    if callback_data.action == "service_toggle":
+        item.is_active = not item.is_active
+        action = "service.toggled"
+    else:
+        item.is_active, item.deleted_at, action = False, utc_now(), "service.soft_deleted"
+    session.add(
+        AuditLog(
+            actor_user_id=db_user.id,
+            action=action,
+            entity_type="service",
+            entity_id=item.id,
+            details={},
+        )
+    )
+    await session.commit()
+    if callback.message:
+        await callback.message.edit_text("Изменение сохранено.", reply_markup=admin_menu())
+    await callback.answer()
+
+
+@router.callback_query(AdminCallback.filter(F.action == "faq_manage"))
+async def faq_manage(
+    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
+) -> None:
+    item = await session.get(FAQItem, UUID(callback_data.entity_id))
+    if item is None:
+        await callback.answer("FAQ не найден.", show_alert=True)
+        return
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="Включить/выключить",
+                callback_data=AdminCallback(action="faq_toggle", entity_id=str(item.id)).pack(),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Удалить",
+                callback_data=AdminCallback(action="faq_delete", entity_id=str(item.id)).pack(),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
+            )
+        ],
+    ]
+    if callback.message:
+        await callback.message.edit_text(
+            f"{item.question}\n\n{item.answer}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer()
+
+
+@router.callback_query(AdminCallback.filter(F.action.in_({"faq_toggle", "faq_delete"})))
+async def faq_mutate(
+    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession, db_user: User
+) -> None:
+    item = await session.get(FAQItem, UUID(callback_data.entity_id))
+    if item is None:
+        await callback.answer("FAQ не найден.", show_alert=True)
+        return
+    if callback_data.action == "faq_toggle":
+        item.is_active = not item.is_active
+        action = "faq.toggled"
+    else:
+        item.is_active, item.deleted_at, action = False, utc_now(), "faq.soft_deleted"
+    session.add(
+        AuditLog(
+            actor_user_id=db_user.id,
+            action=action,
+            entity_type="faq",
+            entity_id=item.id,
+            details={},
+        )
+    )
+    await session.commit()
+    if callback.message:
+        await callback.message.edit_text("Изменение сохранено.", reply_markup=admin_menu())
+    await callback.answer()
+
+
+@router.callback_query(AdminCallback.filter(F.action == "slot_manage"))
+async def slot_manage(
+    callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
+) -> None:
+    slot = await session.get(TimeSlot, UUID(callback_data.entity_id))
+    if slot is None:
+        await callback.answer("Слот не найден.", show_alert=True)
+        return
+    if slot.status == SlotStatus.BOOKED:
+        await callback.answer(
+            "Подтверждённый слот нельзя блокировать автоматически.", show_alert=True
+        )
+        return
+    slot.status = SlotStatus.BLOCKED if slot.status != SlotStatus.BLOCKED else SlotStatus.AVAILABLE
+    await session.commit()
+    if callback.message:
+        await callback.message.edit_text(
+            f"Статус слота: {slot.status.value}", reply_markup=admin_menu()
+        )
+    await callback.answer()
+
+
 @router.callback_query(AdminCallback.filter(F.action == "list"))
 async def list_bookings(
     callback: CallbackQuery, callback_data: AdminCallback, session: AsyncSession
@@ -290,10 +440,104 @@ async def list_bookings(
         statement = statement.join(TimeSlot).where(
             TimeSlot.starts_at >= now, TimeSlot.starts_at < end
         )
-    elif scope in {"schedule", "services", "faq", "settings"}:
+    elif scope == "services":
+        service_items = list(
+            await session.scalars(select(Service).order_by(Service.sort_order).limit(20))
+        )
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=f"{'✅' if item.is_active else '⛔'} {item.name}",
+                    callback_data=AdminCallback(
+                        action="service_manage", entity_id=str(item.id)
+                    ).pack(),
+                )
+            ]
+            for item in service_items
+        ]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
+                )
+            ]
+        )
         if callback.message:
             await callback.message.edit_text(
-                "Раздел открыт. Управление содержимым будет доступно в соответствующем разделе админки.",
+                "Услуги: выберите элемент для управления.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        await callback.answer()
+        return
+    elif scope == "faq":
+        faq_items = list(
+            await session.scalars(
+                select(FAQItem)
+                .where(FAQItem.deleted_at.is_(None))
+                .order_by(FAQItem.sort_order)
+                .limit(20)
+            )
+        )
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=f"{'✅' if item.is_active else '⛔'} {item.question}",
+                    callback_data=AdminCallback(action="faq_manage", entity_id=str(item.id)).pack(),
+                )
+            ]
+            for item in faq_items
+        ]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
+                )
+            ]
+        )
+        if callback.message:
+            await callback.message.edit_text(
+                "FAQ: выберите элемент для управления.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        await callback.answer()
+        return
+    elif scope == "schedule":
+        slot_items = list(
+            await session.scalars(
+                select(TimeSlot)
+                .where(TimeSlot.starts_at > utc_now())
+                .order_by(TimeSlot.starts_at)
+                .limit(20)
+            )
+        )
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=f"{format_studio_time(item.starts_at, 'UTC')} · {item.status.value}",
+                    callback_data=AdminCallback(
+                        action="slot_manage", entity_id=str(item.id)
+                    ).pack(),
+                )
+            ]
+            for item in slot_items
+        ]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="← Админ-меню", callback_data=AdminCallback(action="menu").pack()
+                )
+            ]
+        )
+        if callback.message:
+            await callback.message.edit_text(
+                "Ближайшие слоты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+            )
+        await callback.answer()
+        return
+    elif scope == "settings":
+        if callback.message:
+            await callback.message.edit_text(
+                "Настройки студии задаются переменными окружения. Изменение не затрагивает подтверждённые записи.",
                 reply_markup=admin_menu(),
             )
         await callback.answer()
@@ -301,8 +545,10 @@ async def list_bookings(
     else:
         await callback.answer("Фильтр не найден.", show_alert=True)
         return
-    items = list(await session.scalars(statement.limit(PAGE_SIZE + 1).offset(page * PAGE_SIZE)))
-    visible, has_next = items[:PAGE_SIZE], len(items) > PAGE_SIZE
+    booking_items = list(
+        await session.scalars(statement.limit(PAGE_SIZE + 1).offset(page * PAGE_SIZE))
+    )
+    visible, has_next = booking_items[:PAGE_SIZE], len(booking_items) > PAGE_SIZE
     rows = [
         [
             InlineKeyboardButton(
