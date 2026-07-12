@@ -7,6 +7,7 @@ import structlog
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from app.repositories import UserRepository
 
@@ -61,9 +62,13 @@ class ThrottleMiddleware(BaseMiddleware):
         user = getattr(event, "from_user", None)
         if user:
             key = f"throttle:{user.id}"
-            allowed = await self.redis.set(
-                key, str(time.time()), ex=max(1, int(self.period) + 1), nx=True
-            )
+            try:
+                allowed = await self.redis.set(
+                    key, str(time.time()), ex=max(1, int(self.period) + 1), nx=True
+                )
+            except RedisError as error:
+                await log.awarning("throttle_redis_unavailable", error_type=type(error).__name__)
+                allowed = True
             if not allowed:
                 return None
         return await handler(event, data)

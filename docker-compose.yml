@@ -30,7 +30,7 @@ services:
       redis: {condition: service_healthy}
     command: ["sh", "-c", "alembic upgrade head && python -m app.seed && python -m app.main"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('postgres',5432),2).close()"]
+      test: ["CMD", "python", "-m", "app.health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -38,4 +38,3 @@ services:
 volumes:
   postgres_data:
   redis_data:
-

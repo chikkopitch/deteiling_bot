@@ -30,4 +30,4 @@ def test_missing_required_configuration_is_rejected() -> None:
     incomplete = dict(BASE)
     incomplete.pop("BOT_TOKEN")
     with pytest.raises(ValidationError, match="BOT_TOKEN"):
-        Settings(**incomplete)
+        Settings(_env_file=None, **incomplete)
