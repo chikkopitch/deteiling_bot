@@ -39,7 +39,9 @@ class Settings(BaseSettings):
     @field_validator("REDIS_URL", mode="before")
     @classmethod
     def normalize_optional_redis_url(cls, value: object) -> object:
-        return None if isinstance(value, str) and not value.strip() else value
+        if isinstance(value, str) and value.strip().lower() in {"", "disabled", "none"}:
+            return None
+        return value
 
     @field_validator("STUDIO_TIMEZONE")
     @classmethod
