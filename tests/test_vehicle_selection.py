@@ -118,6 +118,26 @@ async def test_manual_input_removes_controls_and_is_saved() -> None:
     assert payload["custom_vehicle_brand"] == "Другая марка"
 
 
+async def test_single_vehicle_input_moves_directly_to_service_selection() -> None:
+    user = _user()
+    state = _state(user)
+    appointment = Appointment(
+        id=uuid4(), user_id=user.id, status=AppointmentStatus.DRAFT
+    )
+    service = VehicleSelectionService(AsyncMock())
+    service._state_and_appointment = AsyncMock(return_value=(state, appointment))
+    service._save_state = AsyncMock(return_value=state)
+
+    await service.save_vehicle_description(user, BOOKING_FLOW, "  BMW\nX5  ")
+
+    assert appointment.custom_vehicle_brand == "BMW X5"
+    assert appointment.vehicle_model_id is None
+    assert appointment.vehicle_class_id is None
+    _, step, payload = service._save_state.await_args.args
+    assert step == "service_selection"
+    assert payload["custom_vehicle_brand"] == "BMW X5"
+
+
 @pytest.mark.parametrize("raw", ["abcd", "1899", "9999", "20"])
 async def test_invalid_year_is_rejected(raw: str) -> None:
     with pytest.raises(VehicleSelectionError):

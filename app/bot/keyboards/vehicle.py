@@ -150,6 +150,18 @@ def text_input_keyboard(flow: str, entity: str) -> InlineKeyboardMarkup:
     )
 
 
+def vehicle_input_keyboard(flow: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Отменить", callback_data=_callback(flow, "flow", "cancel")
+                )
+            ]
+        ]
+    )
+
+
 def year_keyboard(flow: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

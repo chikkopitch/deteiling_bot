@@ -1,4 +1,4 @@
-"""Service selection and photo upload keyboards."""
+"""Service selection keyboards."""
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -10,10 +10,6 @@ class ServiceCallback(CallbackData, prefix="svc"):
     flow: str
     action: str
     value: str = "-"
-
-
-class PhotoCallback(CallbackData, prefix="photo"):
-    action: str
 
 
 def _service_callback(flow: str, action: str, value: str = "-") -> str:
@@ -79,36 +75,3 @@ def services_keyboard(flow: str, page: ServicePage) -> InlineKeyboardMarkup:
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def photo_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Готово",
-                    callback_data=PhotoCallback(action="done").pack(),
-                ),
-                InlineKeyboardButton(
-                    text="Пропустить",
-                    callback_data=PhotoCallback(action="skip").pack(),
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Удалить последнее фото",
-                    callback_data=PhotoCallback(action="remove").pack(),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="← Назад",
-                    callback_data=PhotoCallback(action="back").pack(),
-                ),
-                InlineKeyboardButton(
-                    text="Отменить",
-                    callback_data=PhotoCallback(action="cancel").pack(),
-                ),
-            ],
-        ]
-    )

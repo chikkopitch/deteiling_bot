@@ -93,6 +93,33 @@ class VehicleSelectionService:
             expires_at=datetime.now(UTC) + STATE_TTL,
         )
 
+    async def save_vehicle_description(
+        self, user: User, flow: str, raw_value: str
+    ) -> ConversationState:
+        """Save a customer's vehicle entered as one free-form value."""
+        value = clean_user_text(raw_value, min_length=3)
+        state, appointment = await self._state_and_appointment(user, flow)
+        payload = dict(state.payload)
+        payload.update(
+            vehicle_brand_id=None,
+            vehicle_brand_name=None,
+            vehicle_model_id=None,
+            vehicle_model_name=None,
+            vehicle_class_id=None,
+            vehicle_class_name=None,
+            custom_vehicle_brand=value,
+            custom_vehicle_model=None,
+            vehicle_year=None,
+        )
+        if appointment is not None:
+            appointment.vehicle_brand_id = None
+            appointment.vehicle_model_id = None
+            appointment.vehicle_class_id = None
+            appointment.custom_vehicle_brand = value
+            appointment.custom_vehicle_model = None
+            appointment.vehicle_year = None
+        return await self._save_state(state, "service_selection", payload)
+
     async def brands_page(self, user_id: UUID, flow: str, page: int = 0) -> Page:
         state = await self._require_state(user_id, flow)
         search = state.payload.get("brand_search")

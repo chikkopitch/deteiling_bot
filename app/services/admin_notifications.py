@@ -58,13 +58,11 @@ def build_admin_application_text(
         f"Telegram ID: <code>{user.telegram_id}</code>\n"
         f"Пользователь: {user_link}\n\n"
         f"Автомобиль: {html.quote(summary.vehicle)}\n"
-        f"Год: {appointment.vehicle_year or 'не указан'}\n"
         f"Услуга: {html.quote(summary.service_name)}\n"
         f"Дата визита: {visit.strftime('%d.%m.%Y')}\n"
         f"Время визита: {visit.strftime('%H:%M')}\n"
         f"Цена: {price}\n"
-        f"Комментарий: {html.quote(appointment.vehicle_comment or 'нет')}\n"
-        f"Фотографий: {summary.photo_count}"
+        f"Комментарий: {html.quote(appointment.vehicle_comment or 'нет')}"
     )
 
 

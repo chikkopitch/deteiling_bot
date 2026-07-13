@@ -86,18 +86,15 @@ async def show_review(
     else:
         price = f"от {_money(summary.price_from, settings)} до {_money(summary.price_to, settings)}"
     local_time = summary.slot.starts_at.astimezone(settings.app_timezone)
-    year = str(appointment.vehicle_year) if appointment.vehicle_year else "не указан"
     comment = appointment.vehicle_comment or "нет"
     await message.answer(
         "<b>Проверьте заявку</b>\n\n"
         f"Автомобиль: {html.quote(summary.vehicle)}\n"
-        f"Год выпуска: {year}\n"
         f"Услуга: {html.quote(summary.service_name)}\n"
         f"Дата: {local_time.strftime('%d.%m.%Y')}\n"
         f"Время: {local_time.strftime('%H:%M')}\n"
         f"Имя: {html.quote(appointment.customer_name or '')}\n"
         f"Телефон: {html.quote(appointment.customer_phone or '')}\n"
-        f"Фотографий: {summary.photo_count}\n"
         f"Предварительная цена: {price}\n"
         f"Комментарий: {html.quote(comment)}",
         reply_markup=review_keyboard(),
@@ -279,7 +276,7 @@ async def handle_review_callback(
             )
         elif callback_data.action == "vehicle":
             state = await VehicleSelectionService(session).set_step(
-                app_user, BOOKING_FLOW, "vehicle_brand", brand_search=None
+                app_user, BOOKING_FLOW, "vehicle_input"
             )
             from app.bot.handlers.vehicle import render_vehicle_step
 

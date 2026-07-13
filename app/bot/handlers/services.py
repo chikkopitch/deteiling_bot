@@ -10,23 +10,11 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.filters import ConversationStepFilter
-from app.bot.keyboards import (
-    CalculatorCallback,
-    PhotoCallback,
-    ServiceCallback,
-    main_menu_keyboard,
-)
+from app.bot.keyboards import CalculatorCallback, ServiceCallback, main_menu_keyboard
 from app.bot.keyboards.calculator import calculation_result_keyboard, factor_keyboard
-from app.bot.keyboards.services import photo_keyboard, services_keyboard
+from app.bot.keyboards.services import services_keyboard
 from app.core.config import get_settings
-from app.database.enums import MediaType
 from app.database.models import ConversationState, User
-from app.services.photo_upload import (
-    MAX_PHOTOS,
-    PhotoAddStatus,
-    PhotoMetadata,
-    PhotoUploadService,
-)
 from app.services.service_selection import ServiceCard, ServiceSelectionService
 from app.services.price_calculator import PriceCalculatorService
 from app.services.user_entry import UserEntryService
@@ -82,18 +70,6 @@ async def show_services(
     if not text:
         text = "Активные услуги пока не настроены."
     await message.answer(text, reply_markup=services_keyboard(flow_code, page))
-
-
-async def show_photo_prompt(
-    message: Message, user: User, session: AsyncSession
-) -> None:
-    count = await PhotoUploadService(session).count(user)
-    await message.answer(
-        "Добавьте фотографии автомобиля как фото или как файл-изображение. "
-        "Фотографии можно пропустить.\n\n"
-        f"Загружено фотографий: {count} из {MAX_PHOTOS}",
-        reply_markup=photo_keyboard(),
-    )
 
 
 async def show_price_result(message: Message, state: ConversationState) -> None:
@@ -179,8 +155,6 @@ async def render_service_step(
             except (ValueError, VehicleSelectionError):
                 pass
         await show_services(message, user, session, flow_code)
-    elif state.step == "photo_upload":
-        await show_photo_prompt(message, user, session)
     elif state.step == "price_result":
         await show_price_result(message, state)
     elif state.step == "price_factors":
@@ -225,7 +199,7 @@ async def handle_service_callback(
             )
         elif callback_data.action == "back":
             state = await VehicleSelectionService(session).set_step(
-                app_user, flow, "vehicle_year"
+                app_user, flow, "vehicle_input" if flow == "booking" else "vehicle_year"
             )
             from app.bot.handlers.vehicle import render_vehicle_step
 
@@ -242,7 +216,6 @@ async def handle_service_callback(
         await render_service_step(callback.message, app_user, session, state)
     except (VehicleSelectionError, ValueError) as error:
         await callback.message.answer(str(error), reply_markup=main_menu_keyboard())
-
 
 @router.callback_query(CalculatorCallback.filter())
 async def handle_calculator(
@@ -315,7 +288,7 @@ async def handle_calculator(
             state = await VehicleSelectionService(session).states.upsert(
                 user_id=app_user.id,
                 flow="booking",
-                step="photo_upload",
+                step="date_selection",
                 payload=payload,
                 expires_at=booking_state.expires_at,
             )
@@ -330,94 +303,4 @@ async def handle_calculator(
                 "Расчёт отменён.", reply_markup=main_menu_keyboard()
             )
     except (VehicleSelectionError, ValueError) as error:
-        await callback.message.answer(str(error), reply_markup=main_menu_keyboard())
-
-
-def photo_metadata_from_message(message: Message) -> PhotoMetadata | None:
-    if message.photo:
-        photo = message.photo[-1]
-        return PhotoMetadata(
-            file_id=photo.file_id,
-            file_unique_id=photo.file_unique_id,
-            media_type=MediaType.PHOTO,
-        )
-    document = message.document
-    if document is not None and (document.mime_type or "").lower().startswith("image/"):
-        return PhotoMetadata(
-            file_id=document.file_id,
-            file_unique_id=document.file_unique_id,
-            media_type=MediaType.DOCUMENT,
-        )
-    return None
-
-
-async def _save_photo(message: Message, app_user: User, session: AsyncSession) -> None:
-    metadata = photo_metadata_from_message(message)
-    if metadata is None:
-        await message.answer(
-            "Этот документ не является изображением. Отправьте фото или файл с MIME-типом image/*.",
-            reply_markup=photo_keyboard(),
-        )
-        return
-    try:
-        result = await PhotoUploadService(session).add(app_user, metadata)
-    except VehicleSelectionError as error:
-        await message.answer(str(error), reply_markup=main_menu_keyboard())
-        return
-    if result.status == PhotoAddStatus.DUPLICATE:
-        prefix = "Это фото уже добавлено."
-    elif result.status == PhotoAddStatus.LIMIT:
-        prefix = "Достигнут лимит. Лишнее фото не сохранено."
-    else:
-        prefix = "Фото сохранено."
-    await message.answer(
-        f"{prefix}\nЗагружено фотографий: {result.count} из {MAX_PHOTOS}",
-        reply_markup=photo_keyboard(),
-    )
-
-
-@router.message(F.photo, ConversationStepFilter("photo_upload"))
-async def receive_photo(
-    message: Message, app_user: User, session: AsyncSession
-) -> None:
-    await _save_photo(message, app_user, session)
-
-
-@router.message(F.document, ConversationStepFilter("photo_upload"))
-async def receive_image_document(
-    message: Message, app_user: User, session: AsyncSession
-) -> None:
-    await _save_photo(message, app_user, session)
-
-
-@router.callback_query(PhotoCallback.filter())
-async def handle_photo_callback(
-    callback: CallbackQuery,
-    callback_data: PhotoCallback,
-    app_user: User,
-    session: AsyncSession,
-) -> None:
-    await callback.answer()
-    if callback.message is None:
-        return
-    try:
-        service = PhotoUploadService(session)
-        if callback_data.action in {"done", "skip"}:
-            state = await service.finish(app_user)
-            await render_service_step(callback.message, app_user, session, state)
-        elif callback_data.action == "remove":
-            count = await service.remove_last(app_user)
-            await callback.message.answer(
-                f"Загружено фотографий: {count} из {MAX_PHOTOS}",
-                reply_markup=photo_keyboard(),
-            )
-        elif callback_data.action == "back":
-            state = await service.back(app_user)
-            await render_service_step(callback.message, app_user, session, state)
-        elif callback_data.action == "cancel":
-            await UserEntryService(session).cancel_flow(app_user, "booking")
-            await callback.message.answer(
-                "Сценарий отменён.", reply_markup=main_menu_keyboard()
-            )
-    except VehicleSelectionError as error:
         await callback.message.answer(str(error), reply_markup=main_menu_keyboard())

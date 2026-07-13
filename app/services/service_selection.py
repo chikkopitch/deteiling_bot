@@ -20,6 +20,7 @@ from app.database.repositories import (
     AppointmentRepository,
     ConversationStateRepository,
     ServiceRepository,
+    VehicleClassRepository,
 )
 from app.services.user_entry import BOOKING_FLOW
 from app.services.vehicle_selection import VehicleSelectionError
@@ -49,17 +50,13 @@ class ServiceSelectionService:
         self.services = ServiceRepository(session)
         self.states = ConversationStateRepository(session)
         self.appointments = AppointmentRepository(session)
+        self.classes = VehicleClassRepository(session)
 
     async def page(self, user: User, flow: str, page: int = 0) -> ServicePage:
         expected_step = (
             "service_selection" if flow == BOOKING_FLOW else "price_services"
         )
         state = await self._require_state(user.id, flow, {expected_step})
-        vehicle_class_id = self._payload_uuid(state, "vehicle_class_id")
-        vehicle_class = await self.session.get(VehicleClass, vehicle_class_id)
-        if vehicle_class is None or not vehicle_class.is_active:
-            raise VehicleSelectionError("Класс автомобиля больше недоступен.")
-
         page = max(page, 0)
         items, total = await self.services.list_page(
             offset=page * SERVICE_PAGE_SIZE, limit=SERVICE_PAGE_SIZE
@@ -71,7 +68,14 @@ class ServiceSelectionService:
                 offset=page * SERVICE_PAGE_SIZE, limit=SERVICE_PAGE_SIZE
             )
 
-        cards = [await self._card(item, vehicle_class) for item in items]
+        if flow == BOOKING_FLOW:
+            cards = [await self._booking_card(item) for item in items]
+        else:
+            vehicle_class_id = self._payload_uuid(state, "vehicle_class_id")
+            vehicle_class = await self.session.get(VehicleClass, vehicle_class_id)
+            if vehicle_class is None or not vehicle_class.is_active:
+                raise VehicleSelectionError("Класс автомобиля больше недоступен.")
+            cards = [await self._card(item, vehicle_class) for item in items]
         return ServicePage(cards=cards, page=page, pages=pages)
 
     async def select(
@@ -86,11 +90,14 @@ class ServiceSelectionService:
         if service is None:
             raise VehicleSelectionError("Услуга больше недоступна. Обновите список.")
         state, appointment = await self._state_and_appointment(user, flow)
-        vehicle_class_id = self._payload_uuid(state, "vehicle_class_id")
-        vehicle_class = await self.session.get(VehicleClass, vehicle_class_id)
-        if vehicle_class is None or not vehicle_class.is_active:
-            raise VehicleSelectionError("Класс автомобиля больше недоступен.")
-        card = await self._card(service, vehicle_class)
+        if flow == BOOKING_FLOW:
+            card = await self._booking_card(service)
+        else:
+            vehicle_class_id = self._payload_uuid(state, "vehicle_class_id")
+            vehicle_class = await self.session.get(VehicleClass, vehicle_class_id)
+            if vehicle_class is None or not vehicle_class.is_active:
+                raise VehicleSelectionError("Класс автомобиля больше недоступен.")
+            card = await self._card(service, vehicle_class)
         payload = dict(state.payload)
         payload.update(
             service_id=str(service.id),
@@ -99,7 +106,7 @@ class ServiceSelectionService:
             estimated_price_to=str(card.price_to),
             consultation=consultation,
         )
-        next_step = "photo_upload" if flow == BOOKING_FLOW else "price_factors"
+        next_step = "date_selection" if flow == BOOKING_FLOW else "price_factors"
         if flow != BOOKING_FLOW:
             payload["factor_index"] = 0
             payload["factor_selections"] = {}
@@ -143,6 +150,18 @@ class ServiceSelectionService:
             service=service,
             price_from=price_from.quantize(quant, rounding=ROUND_HALF_UP),
             price_to=price_to.quantize(quant, rounding=ROUND_HALF_UP),
+        )
+
+    async def _booking_card(self, service: Service) -> ServiceCard:
+        """Return the visible booking price range without asking for a car class."""
+        classes = await self.classes.list_active()
+        if not classes:
+            raise VehicleSelectionError("Администратор ещё не настроил классы автомобилей для расчёта цен.")
+        cards = [await self._card(service, vehicle_class) for vehicle_class in classes]
+        return ServiceCard(
+            service=service,
+            price_from=min(card.price_from for card in cards),
+            price_to=max(card.price_to for card in cards),
         )
 
     async def _require_state(

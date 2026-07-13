@@ -27,7 +27,7 @@ DEFAULT_WELCOME_TEXT = (
     "Добро пожаловать в детейлинг-студию! Выберите нужный раздел в главном меню."
 )
 BOOKING_FLOW = "booking"
-BOOKING_INITIAL_STEP = "vehicle_brand"
+BOOKING_INITIAL_STEP = "vehicle_input"
 
 
 @dataclass(slots=True, frozen=True)

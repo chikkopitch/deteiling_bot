@@ -15,6 +15,7 @@ from app.bot.keyboards.vehicle import (
     classes_keyboard,
     models_keyboard,
     text_input_keyboard,
+    vehicle_input_keyboard,
     year_keyboard,
 )
 from app.database.models import ConversationState, User
@@ -93,7 +94,12 @@ async def render_vehicle_step(
             "Сценарий больше не поддерживается.", reply_markup=main_menu_keyboard()
         )
         return
-    if state.step == "vehicle_brand":
+    if state.step == "vehicle_input":
+        await message.answer(
+            "Введите марку и модель автомобиля одним сообщением, например: BMW X5.",
+            reply_markup=vehicle_input_keyboard(flow_code),
+        )
+    elif state.step == "vehicle_brand":
         await show_brands(message, user, session, flow_code)
     elif state.step == "vehicle_brand_search":
         await message.answer(
@@ -121,11 +127,18 @@ async def render_vehicle_step(
         await show_classes(message, session, flow_code)
     elif state.step == "vehicle_year":
         await show_year(message, flow_code)
+    elif state.step == "photo_upload":
+        # Drafts created before photo uploads were removed continue at the date step.
+        state = await VehicleSelectionService(session).set_step(
+            user, state.flow, "date_selection"
+        )
+        from app.bot.handlers.services import render_service_step
+
+        await render_service_step(message, user, session, state)
     elif state.step in {
         "service_selection",
         "price_services",
         "price_result",
-        "photo_upload",
         "date_selection",
     }:
         from app.bot.handlers.services import render_service_step
@@ -267,6 +280,7 @@ async def handle_vehicle_callback(
 
 
 TEXT_STEPS = (
+    "vehicle_input",
     "vehicle_brand_search",
     "vehicle_model_search",
     "custom_vehicle_brand",
@@ -286,7 +300,14 @@ async def handle_vehicle_text(
     service = VehicleSelectionService(session)
     flow = conversation_state.flow
     try:
-        if conversation_state.step == "vehicle_brand_search":
+        if conversation_state.step == "vehicle_input":
+            state = await service.save_vehicle_description(
+                app_user, flow, message.text
+            )
+            from app.bot.handlers.services import render_service_step
+
+            await render_service_step(message, app_user, session, state)
+        elif conversation_state.step == "vehicle_brand_search":
             query = clean_user_text(message.text, max_length=100)
             await service.set_step(app_user, flow, "vehicle_brand", brand_search=query)
             await show_brands(message, app_user, session, vehicle_flow_code)
@@ -310,8 +331,13 @@ async def handle_vehicle_text(
         keyboard = (
             year_keyboard(vehicle_flow_code)
             if conversation_state.step == "vehicle_year"
-            else text_input_keyboard(
-                vehicle_flow_code, "br" if "brand" in conversation_state.step else "mo"
+            else (
+                vehicle_input_keyboard(vehicle_flow_code)
+                if conversation_state.step == "vehicle_input"
+                else text_input_keyboard(
+                    vehicle_flow_code,
+                    "br" if "brand" in conversation_state.step else "mo",
+                )
             )
         )
         await message.answer(str(error), reply_markup=keyboard)

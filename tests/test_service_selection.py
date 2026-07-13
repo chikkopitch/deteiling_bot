@@ -26,7 +26,7 @@ def _user() -> User:
     return User(id=uuid4(), telegram_id=707070)
 
 
-def _state(user: User, class_id) -> ConversationState:
+def _state(user: User, class_id=None) -> ConversationState:
     return ConversationState(
         id=uuid4(),
         user_id=user.id,
@@ -34,13 +34,13 @@ def _state(user: User, class_id) -> ConversationState:
         step="service_selection",
         payload={
             "appointment_id": str(uuid4()),
-            "vehicle_class_id": str(class_id),
+            **({"vehicle_class_id": str(class_id)} if class_id else {}),
         },
         expires_at=datetime.now(UTC) + timedelta(days=1),
     )
 
 
-async def test_class_specific_service_price_overrides_base_price() -> None:
+async def test_booking_price_range_uses_class_specific_override() -> None:
     user = _user()
     vehicle_class = VehicleClass(
         id=uuid4(),
@@ -71,6 +71,7 @@ async def test_class_specific_service_price_overrides_base_price() -> None:
     )
     service.services.list_page = AsyncMock(return_value=([service_model], 1))
     service.services.get_price = AsyncMock(return_value=override)
+    service.classes.list_active = AsyncMock(return_value=[vehicle_class])
 
     page = await service.page(user, BOOKING_FLOW)
 
@@ -112,6 +113,7 @@ async def test_consultation_preserves_vehicle_and_appends_comment() -> None:
     service = ServiceSelectionService(session)
     service.services.get_active = AsyncMock(return_value=free_service)
     service.services.get_price = AsyncMock(return_value=None)
+    service.classes.list_active = AsyncMock(return_value=[vehicle_class])
     service._state_and_appointment = AsyncMock(return_value=(state, appointment))
     service._save_state = AsyncMock(return_value=state)
 
@@ -124,5 +126,5 @@ async def test_consultation_preserves_vehicle_and_appends_comment() -> None:
         appointment.vehicle_comment == f"Исходный комментарий\n{CONSULTATION_COMMENT}"
     )
     _, step, payload = service._save_state.await_args.args
-    assert step == "photo_upload"
+    assert step == "date_selection"
     assert payload["consultation"] is True

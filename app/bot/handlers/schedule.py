@@ -146,9 +146,9 @@ async def handle_schedule_callback(
                 app_user, BOOKING_FLOW, "date_selection", selected_date=None
             )
             await show_calendar(callback.message, app_user, session, settings)
-        elif callback_data.action == "back_photos":
+        elif callback_data.action in {"back_service", "back_photos"}:
             state = await VehicleSelectionService(session).set_step(
-                app_user, BOOKING_FLOW, "photo_upload"
+                app_user, BOOKING_FLOW, "service_selection"
             )
             from app.bot.handlers.services import render_service_step
 

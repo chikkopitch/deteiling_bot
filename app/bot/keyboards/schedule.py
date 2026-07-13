@@ -90,7 +90,7 @@ def calendar_keyboard(data: CalendarMonth) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(
-                text="← Назад", callback_data=_callback("back_photos")
+                text="← Назад", callback_data=_callback("back_service")
             ),
             InlineKeyboardButton(text="Отменить", callback_data=_callback("cancel")),
         ]
