@@ -1,4 +1,4 @@
-"""Atomic customer submission of a fully populated draft."""
+"""Atomic customer submission of a booking draft."""
 
 from __future__ import annotations
 
@@ -87,7 +87,6 @@ class SubmissionService:
         if not all(
             (
                 appointment.service_id,
-                appointment.vehicle_class_id,
                 appointment.customer_name,
                 appointment.customer_phone,
                 appointment.scheduled_at,

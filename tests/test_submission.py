@@ -31,7 +31,6 @@ def _objects(now: datetime):
         id=uuid4(),
         user_id=user.id,
         service_id=uuid4(),
-        vehicle_class_id=uuid4(),
         slot_id=slot.id,
         scheduled_at=slot.starts_at,
         customer_name="Иван",
