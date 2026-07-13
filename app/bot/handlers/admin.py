@@ -94,13 +94,6 @@ ADMIN_SCHEDULE_FLOW = "admin_schedule"
 ADMIN_SCHEDULE_STATE_TTL = timedelta(minutes=30)
 
 SECTION_PERMISSIONS = {
-    "admins": Permission.MANAGE_ADMINS,
-    "roles": Permission.MANAGE_ADMINS,
-    "new": Permission.VIEW_APPOINTMENTS,
-    "today": Permission.VIEW_APPOINTMENTS,
-    "tomorrow": Permission.VIEW_APPOINTMENTS,
-    "future": Permission.VIEW_APPOINTMENTS,
-    "all": Permission.VIEW_APPOINTMENTS,
     "schedule": Permission.MANAGE_SCHEDULE,
     "free_slots": Permission.MANAGE_SCHEDULE,
     "services": Permission.MANAGE_SERVICES,
@@ -108,10 +101,7 @@ SECTION_PERMISSIONS = {
     "calculator": Permission.MANAGE_PRICES,
     "faq": Permission.MANAGE_FAQ,
     "requests": Permission.MANAGE_REQUESTS,
-    "clients": Permission.VIEW_CLIENTS,
-    "statistics": Permission.VIEW_STATISTICS,
     "settings": Permission.MANAGE_SETTINGS,
-    "audit": Permission.VIEW_AUDIT,
 }
 
 APPLICATION_ACTION_PERMISSIONS = {
@@ -227,10 +217,7 @@ async def handle_admin_section(
                         reply_markup=entity_list_keyboard("factor_value", values),
                     )
             return
-        await callback.message.answer(
-            f"Раздел <b>{callback_data.section}</b> доступен. "
-            "Его операции будут подключены следующими этапами."
-        )
+        await callback.message.answer("Раздел больше не доступен.")
 
 
 async def show_admin_schedule_menu(message: Message) -> None:

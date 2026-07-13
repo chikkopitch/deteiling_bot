@@ -21,13 +21,6 @@ class AdminChangeCallback(CallbackData, prefix="admchg"):
 
 
 ADMIN_SECTIONS = (
-    ("admins", "Администраторы"),
-    ("roles", "Роли"),
-    ("new", "Новые заявки"),
-    ("today", "Сегодня"),
-    ("tomorrow", "Завтра"),
-    ("future", "Будущие записи"),
-    ("all", "Все заявки"),
     ("schedule", "Расписание"),
     ("free_slots", "Свободные слоты"),
     ("services", "Услуги"),
@@ -35,10 +28,7 @@ ADMIN_SECTIONS = (
     ("calculator", "Калькулятор"),
     ("faq", "FAQ"),
     ("requests", "Запросы менеджеру"),
-    ("clients", "Поиск клиента"),
-    ("statistics", "Статистика"),
     ("settings", "Настройки"),
-    ("audit", "Журнал действий"),
 )
 
 
